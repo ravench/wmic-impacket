@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wmic-impacket"
+version = "0.1.0"
+description = "Drop-in replacement for the Samba-based Linux wmic binary, built on Impacket (DCOM hardening / event 10036 compatible)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "raven" }]
+requires-python = ">=3.8"
+keywords = ["wmi", "wmic", "dcom", "observium", "impacket", "windows", "monitoring"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+# 0.12.0: DCOMConnection.disconnect() no longer raises when the connection never
+# got far enough to register objects (fortra/impacket#1039), Unicode fixes, and
+# Python 3.8 is still supported.  The DCOM activation binding has defaulted to
+# RPC_C_AUTHN_LEVEL_PKT_PRIVACY since long before that (0.9.15 or earlier), and
+# proper NULL handling in WMI object parsing arrived in 0.9.24.
+dependencies = ["impacket>=0.12.0"]
+
+[project.urls]
+Homepage = "https://github.com/ravench/wmic-impacket"
+
+[project.scripts]
+wmic = "wmic_impacket:main"
+wmic-impacket = "wmic_impacket:main"
+
+[tool.setuptools]
+py-modules = ["wmic_impacket"]
