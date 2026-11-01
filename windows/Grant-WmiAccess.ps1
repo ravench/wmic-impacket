@@ -54,10 +54,23 @@
 .PARAMETER SkipServiceManager
     Do not touch the Service Control Manager's security descriptor (step 4).
 
+.PARAMETER Modules
+    Grant exactly the services that the named Observium WMI poller modules query
+    (the list shown on a device's WMI settings page).  Only three modules read
+    services:
+      winservices -> every service (Win32_Service, unfiltered)
+      exchange    -> MSExchange* services
+      mssql       -> MSSQL* services (MSSQLSERVER and MSSQL$<instance>)
+    os, processors and storage read Win32_OperatingSystem / Win32_Processor /
+    Win32_LogicalDisk and need no service grants.  Use this to match the grant
+    to the modules you actually enable, e.g. -Modules mssql,exchange.  Combines
+    with -Services (the two sets are unioned).
+
 .PARAMETER Services
     Names of the services to grant read access on (step 5).  Accepts service
     names (not display names) and wildcards, e.g. -Services MSSQL*,W3SVC.
-    Default: every local service.
+    Default (no -Modules, no -Services): every local service, which is what the
+    winservices module (on by default) polls.
 
 .PARAMETER SkipServices
     Do not touch individual service security descriptors (step 5).
@@ -69,6 +82,7 @@
 .EXAMPLE
     PS> .\Grant-WmiAccess.ps1
     PS> .\Grant-WmiAccess.ps1 -User wmi -RemoteAddress 192.0.2.5
+    PS> .\Grant-WmiAccess.ps1 -Modules mssql,exchange          # only those services
     PS> .\Grant-WmiAccess.ps1 -Services MSSQL*,W3SVC,Spooler
     PS> .\Grant-WmiAccess.ps1 -SkipServices -Namespace 'root\cimv2' -WhatIf
 
@@ -89,6 +103,9 @@ param(
     [string[]]$RemoteAddress,
 
     [switch]$SkipServiceManager,
+
+    [ValidateSet('os', 'processors', 'storage', 'winservices', 'exchange', 'mssql')]
+    [string[]]$Modules,
 
     [string[]]$Services,
 
@@ -290,13 +307,40 @@ if (-not $SkipServices) {
     $svcAceMask = 'CCLCSWLORC'
     $svcAce     = "(A;;$svcAceMask;;;$sid)"
 
-    if ($Services) {
-        $targets = @(Get-Service -Name $Services -ErrorAction SilentlyContinue)
-    } else {
-        $targets = @(Get-Service)
+    # Which Observium WMI poller modules read services, and the service-name
+    # patterns each queries (see includes/polling/wmi.inc.php).
+    $moduleServicePatterns = @{
+        exchange    = @('MSExchange*')
+        mssql       = @('MSSQL*')          # MSSQLSERVER and MSSQL$<instance>
+        winservices = @('*')               # every service
     }
+    $grantAll = $false
+    $patterns = @()
+    if ($Modules) {
+        foreach ($m in $Modules) {
+            if ($moduleServicePatterns.ContainsKey($m)) {
+                if ($moduleServicePatterns[$m] -contains '*') { $grantAll = $true }
+                $patterns += $moduleServicePatterns[$m]
+            } else {
+                Write-Host "[i] Module '$m' reads no services (needs no per-service grant)"
+            }
+        }
+    }
+    if ($Services) { $patterns += $Services }
+
+    if (-not $Modules -and -not $Services) {
+        $targets = @(Get-Service)                               # default: all (winservices)
+    } elseif ($grantAll) {
+        $targets = @(Get-Service)
+    } elseif ($patterns.Count -gt 0) {
+        $targets = @(Get-Service -Name $patterns -ErrorAction SilentlyContinue)
+    } else {
+        $targets = @()                                          # only no-service modules named
+    }
+    $targets = @($targets | Sort-Object -Property Name -Unique)
+
     if ($targets.Count -eq 0) {
-        Write-Warning "No matching services found; step 5 skipped."
+        Write-Host "[=] No services to grant (step 5)."
     } else {
         if (-not $RestoreScript) {
             $RestoreScript = Join-Path (Get-Location) ("Grant-WmiAccess-restore-services-{0:yyyyMMdd-HHmmss}.cmd" -f (Get-Date))

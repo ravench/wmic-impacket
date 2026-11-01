@@ -153,15 +153,33 @@ powershell.exe -ExecutionPolicy Bypass -File .\Grant-WmiAccess.ps1 -User wmi -Re
   for `sc.exe sdset scmanager "<old SDDL>"`; `-SkipServiceManager` leaves it alone.
 - The per-service step grants read access (`CCLCSWLORC`: query config + status,
   enumerate dependents, interrogate, read control) on **every** local service by
-  default, because Observium polls them all unless `$config['wmi']['service_permit']`
-  restricts the list. Each changed service's old SDDL is saved to a `...-restore-services-*.cmd`
-  script. Scope it with `-Services MSSQL*,W3SVC,Spooler`, or skip it with `-SkipServices`.
+  default, because the `winservices` module (on by default) polls them all unless
+  `$config['wmi']['service_permit']` restricts the list. Each changed service's
+  old SDDL is saved to a `...-restore-services-*.cmd` script. Scope it with
+  `-Modules`/`-Services`, or skip it with `-SkipServices`.
 - `-WhatIf` shows what would change without changing anything.
 
 The per-service grants are what make *all* services visible: the Service Control
 Manager grant only lets the account enumerate the list, while each service's own
 security descriptor still decides whether it can be read, and non-admins cannot
 read some by default (so they silently drop out of `Win32_Service`).
+
+### Scope the service grant to the modules you use
+
+A device's WMI settings page lists the poller modules. Only three read services,
+so you can grant exactly what the modules you enable will query instead of every
+service:
+
+| WMI module | Queries | `-Modules` grants |
+| --- | --- | --- |
+| `os`, `processors`, `storage` | `Win32_OperatingSystem` / `Win32_Processor` / `Win32_LogicalDisk` | nothing (no services read) |
+| `winservices` (default on) | all of `Win32_Service` | every service |
+| `exchange` | `Win32_Service` `WHERE Name LIKE '%MSExchange%'` | `MSExchange*` |
+| `mssql` | `Win32_Service` `WHERE Name LIKE '%MSSQL%'` | `MSSQL*` |
+
+So on a SQL box monitored with only the `mssql` module (winservices off),
+`-Modules mssql` grants read access to just the SQL Server services and leaves
+the rest untouched. With `winservices` on, you still need every service.
 
 ## Options
 
