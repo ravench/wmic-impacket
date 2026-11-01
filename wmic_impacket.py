@@ -35,7 +35,7 @@ import types
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # The version string the original binary reports; some tooling greps for it.
 SAMBA_WMIC_VERSION = "4.0.0tp4-SVN-build-UNKNOWN"
