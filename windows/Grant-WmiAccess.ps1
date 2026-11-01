@@ -346,7 +346,7 @@ if (-not $SkipServices) {
             $RestoreScript = Join-Path (Get-Location) ("Grant-WmiAccess-restore-services-{0:yyyyMMdd-HHmmss}.cmd" -f (Get-Date))
         }
         $restoreLines = @('@echo off', 'rem Restores service security descriptors changed by Grant-WmiAccess.ps1')
-        $granted = 0; $already = 0; $failed = 0
+        $granted = 0; $already = 0; $failed = 0; $protected = 0
         foreach ($svc in $targets) {
             $name = $svc.Name
             try {
@@ -363,22 +363,35 @@ if (-not $SkipServices) {
                 $saclAt = $cur.IndexOf('S:')
                 if ($saclAt -ge 0) { $new = $cur.Insert($saclAt, $svcAce) } else { $new = $cur + $svcAce }
                 if ($PSCmdlet.ShouldProcess($name, "Add $svcAce")) {
-                    $restoreLines += "sc.exe sdset `"$name`" `"$cur`""
                     $res = & sc.exe sdset "$name" "$new" 2>&1
                     if ($LASTEXITCODE -ne 0) { throw ($res -join ' ') }
+                    # Record the restore line only after the change actually took.
+                    $restoreLines += "sc.exe sdset `"$name`" `"$cur`""
                     $granted++
                 }
             } catch {
-                $failed++
-                Write-Warning "Service '$name': $($_.Exception.Message)"
+                # Protected OS services (Defender, gpsvc, Dnscache, ...) deny
+                # WRITE_DAC even to administrators -- FEHLER 5 / access denied.
+                if ("$($_.Exception.Message)" -match 'FEHLER 5|error 5|[Aa]ccess|[Vv]erweigert|[Dd]enied') {
+                    $protected++
+                } else {
+                    $failed++
+                    Write-Warning "Service '$name': $($_.Exception.Message)"
+                }
             }
         }
         if ($granted -gt 0 -and -not $WhatIfPreference) {
             Set-Content -Path $RestoreScript -Value $restoreLines -Encoding ASCII
-            Write-Host "[+] Granted read access on $granted service(s); $already already had it, $failed failed"
+            Write-Host "[+] Granted read access on $granted service(s); $already already had it"
             Write-Host "[i] To undo the service changes, run: $RestoreScript"
         } else {
-            Write-Host "[=] Services: $already already granted, $granted to change, $failed failed"
+            Write-Host "[=] Services: $already already granted, $granted to change"
+        }
+        if ($protected -gt 0) {
+            Write-Host "[i] $protected protected service(s) could not be changed (access denied even as admin). This is normal for OS services such as Windows Defender, gpsvc and Dnscache; they stay hidden from the account and are safe to ignore."
+        }
+        if ($failed -gt 0) {
+            Write-Warning "$failed service(s) failed for other reasons (see warnings above)."
         }
     }
 }

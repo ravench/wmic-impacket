@@ -164,6 +164,12 @@ Manager grant only lets the account enumerate the list, while each service's own
 security descriptor still decides whether it can be read, and non-admins cannot
 read some by default (so they silently drop out of `Win32_Service`).
 
+A couple of dozen protected OS services (Windows Defender, `gpsvc`, `Dnscache`,
+`LSM`, `sppsvc` and the like) deny even an administrator write access to their
+security descriptor, so the script reports them as protected and leaves them
+alone. They stay hidden from the account; this is expected and safe to ignore
+unless you specifically need to monitor one of them.
+
 ### Scope the service grant to the modules you use
 
 A device's WMI settings page lists the poller modules. Only three read services,
