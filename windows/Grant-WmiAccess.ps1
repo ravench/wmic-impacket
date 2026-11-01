@@ -18,6 +18,13 @@
       3. Enables the built-in firewall rule group "Windows Management
          Instrumentation (WMI)" (@FirewallAPI.dll,-34251), optionally restricting
          the inbound rules to -RemoteAddress.
+      4. Lets the user list services remotely (Win32_Service, Observium's
+         winservices module): adds "(A;;CCLCRPRC;;;<SID>)" (connect, enumerate,
+         query lock status, read control) to the Service Control Manager's
+         security descriptor unless an entry for the SID exists.  Without it
+         Win32_Service queries fail with WBEM_E_ACCESS_DENIED for non-admins.
+         The previous descriptor is printed so it can be restored with
+         sc.exe sdset scmanager "<old SDDL>".  Skip with -SkipServiceManager.
 
     Requires Windows PowerShell 5.1 (the WMI cmdlets and the [wmiclass] accelerator
     are not available in PowerShell 7).
@@ -32,6 +39,9 @@
     Optional.  Restricts the inbound WMI/DCOM firewall rules to this address,
     subnet or list (e.g. 192.0.2.5 or 192.0.2.0/24).  Use 'Any' to remove an
     earlier restriction.  When omitted the rules' address scope is left as is.
+
+.PARAMETER SkipServiceManager
+    Do not touch the Service Control Manager's security descriptor (step 4).
 
 .EXAMPLE
     PS> .\Grant-WmiAccess.ps1
@@ -52,7 +62,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Namespace = 'root\cimv2',
 
-    [string[]]$RemoteAddress
+    [string[]]$RemoteAddress,
+
+    [switch]$SkipServiceManager
 )
 
 Set-StrictMode -Version 2.0
@@ -207,6 +219,34 @@ if ($rules.Count -eq 0) {
         if ($PSCmdlet.ShouldProcess("$($inbound.Count) inbound WMI rule(s)", "Set RemoteAddress to $($RemoteAddress -join ', ')")) {
             $inbound | Set-NetFirewallRule -RemoteAddress $RemoteAddress
             Write-Host "[+] Inbound WMI rules restricted to $($RemoteAddress -join ', ')"
+        }
+    }
+}
+
+# --- 4. Service Control Manager --------------------------------------------
+# Remote service enumeration needs SC_MANAGER_CONNECT (CC),
+# SC_MANAGER_ENUMERATE_SERVICE (LC), SC_MANAGER_QUERY_LOCK_STATUS (RP) and
+# READ_CONTROL (RC) on the SCM; by default only administrators get them over
+# the network.
+if (-not $SkipServiceManager) {
+    $sdshow = @(& sc.exe sdshow scmanager)
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe sdshow scmanager failed: $($sdshow -join ' ')" }
+    $sddl = (($sdshow | Where-Object { $_ -match '\S' }) -join '').Trim()
+    if (-not $sddl.StartsWith('D:') -and $sddl -notmatch '^(O:[^:]+)?(G:[^:]+)?D:') {
+        throw "Unexpected SDDL from 'sc.exe sdshow scmanager': $sddl"
+    }
+    if ($sddl -match [regex]::Escape(";$sid)")) {
+        Write-Host "[=] Service Control Manager already has an entry for $sid"
+    } else {
+        $scmAce = "(A;;CCLCRPRC;;;$sid)"
+        $saclAt = $sddl.IndexOf('S:')
+        if ($saclAt -ge 0) { $newSddl = $sddl.Insert($saclAt, $scmAce) } else { $newSddl = $sddl + $scmAce }
+        if ($PSCmdlet.ShouldProcess('Service Control Manager', "Add $scmAce")) {
+            Write-Host "[i] Previous Service Control Manager descriptor; restore with: sc.exe sdset scmanager `"<SDDL>`""
+            Write-Host "    $sddl"
+            $sdset = @(& sc.exe sdset scmanager $newSddl)
+            if ($LASTEXITCODE -ne 0) { throw "sc.exe sdset scmanager failed: $($sdset -join ' ')" }
+            Write-Host "[+] Granted $($localUser.Name) remote service list access (Service Control Manager)"
         }
     }
 }

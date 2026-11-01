@@ -132,8 +132,10 @@ Add `-d1` to see Impacket's debug output on stderr.
 ## Windows-side setup
 
 The polled account needs: membership in *Distributed COM Users* and *Performance
-Monitor Users*, *Enable Account* + *Remote Enable* on the WMI namespace, and the
-*Windows Management Instrumentation (WMI)* firewall rule group. The script
+Monitor Users*, *Enable Account* + *Remote Enable* on the WMI namespace, the
+*Windows Management Instrumentation (WMI)* firewall rule group, and, for
+`Win32_Service` (Observium's service list), remote list access to the Service
+Control Manager, which Windows grants only to administrators by default. The script
 [`windows/Grant-WmiAccess.ps1`](windows/Grant-WmiAccess.ps1) does all of that
 idempotently; run it in an elevated **Windows PowerShell 5.1** on the target:
 
@@ -144,6 +146,9 @@ powershell.exe -ExecutionPolicy Bypass -File .\Grant-WmiAccess.ps1 -User wmi -Re
 
 `-Namespace` defaults to `root\cimv2`; `-RemoteAddress` scopes the inbound firewall
 rules to your monitoring host (omit it to leave the scope untouched, `Any` to reset).
+The Service Control Manager step adds `(A;;CCLCRPRC;;;<user SID>)` (connect,
+enumerate, query lock status, read control) and prints the previous descriptor
+for `sc.exe sdset scmanager "<old SDDL>"`; `-SkipServiceManager` leaves it alone.
 `-WhatIf` shows what would change.
 
 ## Options
@@ -224,6 +229,8 @@ style, so it does not tell them apart.
 | `Login to remote object.` + `NT_STATUS_ACCESS_DENIED` with `WBEM_E_ACCESS_DENIED` (`0x80041003`) | DCOM fine, but no *Enable Account* / *Remote Enable* on the namespace. |
 | `Login to remote object.` + `WBEM_E_INVALID_NAMESPACE` | `--namespace` typo. |
 | `ERROR: Retrieve result data.` + `WBEM_E_INVALID_CLASS` / `WBEM_E_INVALID_QUERY` | Class does not exist on that host / WQL syntax error. |
+| `ERROR: Retrieve result data.` + `WBEM_E_ACCESS_DENIED`, only for `Win32_Service` | Non-admin user without remote access to the Service Control Manager. Run `Grant-WmiAccess.ps1` (step 4) on the target. |
+| `Login to remote object.` + `NT_STATUS_IO_TIMEOUT` after `--timeout` seconds | Packets are dropped, usually by the Windows firewall (WMI rule group disabled, or the network is in the *Public* profile). A rejected connection gives `NT_STATUS_CONNECTION_REFUSED` instead. |
 | `Login to remote object.` + `NT_STATUS_BAD_NETWORK_NAME`, stderr says `empty host name in '//'` | The caller passed `//` with no host name after it. |
 | Observium's device WMI page says "The wmic binary (or script) was not found at the configured path", although the path is right | Observium prints that for *any* failure of its `wmi_cmd()`, including an empty WMI username (wmic is then never run). With *Override WMI Config* ticked, fill in at least the username (a blank hostname falls back to the device hostname); otherwise untick it and set `$config['wmi']['user']` / `['pass']` / `['domain']` globally. |
 | Observium only shows the first CPU / disk / service | The output style does not match your Observium's parser. Current releases need the default `per-object`; releases whose `wmi_parse()` does not reset after each row need `--output-style single` (append it to `$config['wmic']`). |
