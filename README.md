@@ -24,12 +24,47 @@ wmic-impacket runs both the DCOM activation (`IRemoteSCMActivator`) and the
 
 ## Install
 
+### Dependencies
+
+System packages:
+
+| Package | Why |
+| --- | --- |
+| `python3` (3.8 or newer) | runtime |
+| `python3-venv` | Debian ships the `venv`/`ensurepip` modules separately |
+| `git` | `pip install git+https://...` clones the repository |
+
+Python packages, installed by pip into the venv (nothing system-wide):
+
+* `impacket` >= 0.12.0, which in turn pulls in `pyasn1`, `pyasn1_modules`,
+  `pycryptodomex`, `pyOpenSSL` / `cryptography`, `six`, `charset_normalizer`,
+  `ldap3`, `ldapdomaindump` and `flask` (the last three are Impacket
+  dependencies that wmic-impacket never uses).
+
+### Debian / Ubuntu
+
+Debian 11 (bullseye) or newer, Ubuntu 20.04 or newer. Debian 10 ships Python 3.7,
+which is too old.
+
 ```sh
-python3 -m venv /opt/wmic-impacket
-/opt/wmic-impacket/bin/pip install git+https://github.com/ravench/wmic-impacket
+sudo apt update
+sudo apt install python3 python3-venv git
+
+sudo python3 -m venv /opt/wmic-impacket
+sudo /opt/wmic-impacket/bin/pip install --upgrade pip
+sudo /opt/wmic-impacket/bin/pip install git+https://github.com/ravench/wmic-impacket
+
+/opt/wmic-impacket/bin/wmic --version
 ```
 
-Python 3.8 or newer. Impacket (>= 0.12.0) and its dependencies are pulled in by pip.
+Upgrading pip first matters on older releases: the pip bundled with Debian 11 may
+not recognise the current prebuilt wheels for `cryptography`, `cffi` and
+`pycryptodomex` and would try to compile them from source. Prebuilt wheels exist
+for amd64 and arm64. On other architectures (i386, armhf) pip has to compile,
+which needs `sudo apt install build-essential python3-dev libffi-dev libssl-dev`
+plus a Rust toolchain for `cryptography`.
+
+To update later, run the last `pip install` again with `--upgrade`.
 
 ## Observium configuration
 
@@ -172,13 +207,14 @@ static binary was faster. Keep `--timeout` comfortably above your slowest query.
 ## Development
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -e . 
+sudo apt install python3 python3-venv git php-cli   # php-cli only for the Observium compatibility test
+python3 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
 The tests run offline against fakes of the Impacket objects, decode a genuine
 Impacket-encoded WMI instance, and pipe generated output through Observium's real
-`wmi_parse()` (`tests/observium_wmi_parse.php`, needs `php` on the PATH).
+`wmi_parse()` (`tests/observium_wmi_parse.php`; skipped if `php` is not on the PATH).
 
 ## License
 
