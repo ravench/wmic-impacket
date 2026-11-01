@@ -54,6 +54,19 @@
 .PARAMETER SkipServiceManager
     Do not touch the Service Control Manager's security descriptor (step 4).
 
+    The per-service grant (step 5) has two modes:
+      * every service -- the default, and explicitly -AllServices. Matches the
+        winservices module (on by default), which polls every service.
+      * individual services -- -Services and/or -Modules, granting only the
+        named set. Use this when you restrict Observium to specific services
+        (via $config['wmi']['service_permit']) or only run the exchange/mssql
+        modules.
+
+.PARAMETER AllServices
+    Grant read access on every local service (the default when no -Services or
+    -Modules is given).  Pass it explicitly to force "all" even alongside
+    -Services/-Modules.
+
 .PARAMETER Modules
     Grant exactly the services that the named Observium WMI poller modules query
     (the list shown on a device's WMI settings page).  Only three modules read
@@ -67,10 +80,8 @@
     with -Services (the two sets are unioned).
 
 .PARAMETER Services
-    Names of the services to grant read access on (step 5).  Accepts service
-    names (not display names) and wildcards, e.g. -Services MSSQL*,W3SVC.
-    Default (no -Modules, no -Services): every local service, which is what the
-    winservices module (on by default) polls.
+    Names of the individual services to grant read access on (step 5).  Accepts
+    service names (not display names) and wildcards, e.g. -Services MSSQL*,W3SVC.
 
 .PARAMETER SkipServices
     Do not touch individual service security descriptors (step 5).
@@ -80,10 +91,10 @@
     Default: a timestamped file under the current directory.
 
 .EXAMPLE
-    PS> .\Grant-WmiAccess.ps1
-    PS> .\Grant-WmiAccess.ps1 -User wmi -RemoteAddress 192.0.2.5
-    PS> .\Grant-WmiAccess.ps1 -Modules mssql,exchange          # only those services
-    PS> .\Grant-WmiAccess.ps1 -Services MSSQL*,W3SVC,Spooler
+    PS> .\Grant-WmiAccess.ps1                                   # every service (default)
+    PS> .\Grant-WmiAccess.ps1 -AllServices                      # every service, explicit
+    PS> .\Grant-WmiAccess.ps1 -Services MSSQL*,W3SVC,Spooler    # individual services
+    PS> .\Grant-WmiAccess.ps1 -Modules mssql,exchange           # services of those modules
     PS> .\Grant-WmiAccess.ps1 -SkipServices -Namespace 'root\cimv2' -WhatIf
 
 .NOTES
@@ -103,6 +114,8 @@ param(
     [string[]]$RemoteAddress,
 
     [switch]$SkipServiceManager,
+
+    [switch]$AllServices,
 
     [ValidateSet('os', 'processors', 'storage', 'winservices', 'exchange', 'mssql')]
     [string[]]$Modules,
@@ -328,11 +341,12 @@ if (-not $SkipServices) {
     }
     if ($Services) { $patterns += $Services }
 
-    if (-not $Modules -and -not $Services) {
-        $targets = @(Get-Service)                               # default: all (winservices)
-    } elseif ($grantAll) {
+    if ($AllServices -or $grantAll -or (-not $Modules -and -not $Services)) {
+        # Explicit -AllServices, -Modules winservices, or the no-selection
+        # default: every service (what the winservices module polls).
         $targets = @(Get-Service)
     } elseif ($patterns.Count -gt 0) {
+        # Individual services: the -Services / -Modules selection only.
         $targets = @(Get-Service -Name $patterns -ErrorAction SilentlyContinue)
     } else {
         $targets = @()                                          # only no-service modules named

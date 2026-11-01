@@ -152,11 +152,16 @@ powershell.exe -ExecutionPolicy Bypass -File .\Grant-WmiAccess.ps1 -User wmi -Re
   enumerate, query lock status, read control) and prints the previous descriptor
   for `sc.exe sdset scmanager "<old SDDL>"`; `-SkipServiceManager` leaves it alone.
 - The per-service step grants read access (`CCLCSWLORC`: query config + status,
-  enumerate dependents, interrogate, read control) on **every** local service by
-  default, because the `winservices` module (on by default) polls them all unless
-  `$config['wmi']['service_permit']` restricts the list. Each changed service's
-  old SDDL is saved to a `...-restore-services-*.cmd` script. Scope it with
-  `-Modules`/`-Services`, or skip it with `-SkipServices`.
+  enumerate dependents, interrogate, read control) and has two modes:
+  - **every service** — the default, and explicitly `-AllServices`. Matches the
+    `winservices` module (on by default), which polls every service unless
+    `$config['wmi']['service_permit']` restricts the list.
+  - **individual services** — `-Services Name1,Name2` (wildcards allowed) and/or
+    `-Modules`, granting only the named set. Use this when you restrict Observium
+    to specific services or only run the `exchange`/`mssql` modules.
+
+  Each changed service's old SDDL is saved to a `...-restore-services-*.cmd`
+  script, and `-SkipServices` skips the step entirely.
 - `-WhatIf` shows what would change without changing anything.
 
 The per-service grants are what make *all* services visible: the Service Control
