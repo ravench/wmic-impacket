@@ -153,6 +153,14 @@ class UsageError(Exception):
     Observium only looks at stdout and only recognises lines containing ``ERROR:``."""
 
 
+class EmptyHostError(UsageError):
+    """``//`` with nothing after it.  Observium sends exactly that when "Override WMI
+    config" is ticked on a device but the WMI hostname field is blank.  run() reports
+    it as ``Login to remote object.`` (what the original wmic says when it cannot
+    reach a host), because Observium shows a misleading "wmic binary not found"
+    message for any ERROR text it does not know."""
+
+
 class _Parser(argparse.ArgumentParser):
     """ArgumentParser that raises instead of printing and exiting on usage errors."""
 
@@ -343,7 +351,10 @@ def parse_args(argv: List[str]) -> types.SimpleNamespace:
         parser.error("host (//HOST) and QUERY are required")
     opts.host = parse_host(ns.host)
     if not opts.host:
-        parser.error("empty host name")
+        raise EmptyHostError(
+            "empty host name in %r (in Observium: 'Override WMI config' is enabled "
+            "but the WMI hostname is blank)" % ns.host
+        )
     opts.query = ns.query
 
     # Credentials: -A file first, then -U (which may carry DOMAIN and %PASSWORD),
@@ -550,7 +561,7 @@ def classify_exception(exc: BaseException) -> Tuple[str, str]:
         status = "NT_STATUS_CONNECTION_REFUSED"
     elif err_no in (errno.EHOSTUNREACH, errno.ENETUNREACH) or "unreachable" in low or "no route to host" in low:
         status = "NT_STATUS_HOST_UNREACHABLE"
-    elif isinstance(exc, socket.gaierror) or "name or service not known" in low or "name resolution" in low \
+    elif isinstance(exc, EmptyHostError) or isinstance(exc, socket.gaierror) or "name or service not known" in low or "name resolution" in low \
             or "nodename nor servname" in low or "getaddrinfo failed" in low:
         status = "NT_STATUS_BAD_NETWORK_NAME"
     elif err_no == errno.ECONNRESET or "connection reset" in low or "connection closed by remote host" in low:
@@ -810,6 +821,9 @@ def run(argv: Optional[List[str]] = None, stdout=None, stderr=None, impacket: Op
 
     try:
         opts = parse_args(list(argv))
+    except EmptyHostError as exc:
+        report_error(out, err, MSG_LOGIN, exc)
+        return 1
     except UsageError as exc:
         out.write("%s ERROR: %s\n" % (TAG, exc))
         err.write(build_parser().format_usage())

@@ -672,6 +672,19 @@ class TestRun(unittest.TestCase):
         self.assertIn("ERROR:", out)
         self.assertIn("usage:", err)
 
+    def test_empty_host_is_a_login_error(self):
+        # Observium with "Override WMI config" ticked and every field blank.
+        fab = Fabric()
+        code, out, err = run_fake(
+            "--user='' --no-pass --delimiter=## --namespace='root\\CIMV2' // 'SELECT Name FROM Win32_ComputerSystem'",
+            fab,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "[wmic-impacket] ERROR: Login to remote object.\n")
+        self.assertIn("NTSTATUS: NT_STATUS_BAD_NETWORK_NAME", err)
+        self.assertIn("Override WMI config", err)
+        self.assertIsNone(fab.dcom, "must not try to connect anywhere")
+
     def test_help(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

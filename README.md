@@ -192,6 +192,7 @@ Deliberate deviations:
 | `Login to remote object.` + `NT_STATUS_ACCESS_DENIED` with `WBEM_E_ACCESS_DENIED` (`0x80041003`) | DCOM fine, but no *Enable Account* / *Remote Enable* on the namespace. |
 | `Login to remote object.` + `WBEM_E_INVALID_NAMESPACE` | `--namespace` typo. |
 | `ERROR: Retrieve result data.` + `WBEM_E_INVALID_CLASS` / `WBEM_E_INVALID_QUERY` | Class does not exist on that host / WQL syntax error. |
+| `Login to remote object.` + `NT_STATUS_BAD_NETWORK_NAME`, stderr says `empty host name in '//'` | Observium sent no host name: *Override WMI config* is ticked on the device but the WMI hostname is blank. Untick the override (the device hostname and the global `$config['wmi']` credentials are then used) or fill in every field. Older builds of this tool printed `ERROR: empty host name`, which Observium reported as "The wmic binary (or script) was not found". |
 | Observium shows the device as having no WMI data | Run the exact command from `includes/wmi.inc.php` by hand with `-d1`. |
 
 Impacket is also a well-known penetration-testing toolkit. Its DCOM/WMI traffic
