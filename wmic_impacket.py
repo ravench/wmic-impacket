@@ -34,12 +34,13 @@ import re
 import signal
 import socket
 import sys
+import time
 import traceback
 import types
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # The version string the original binary reports; some tooling greps for it.
 SAMBA_WMIC_VERSION = "4.0.0tp4-SVN-build-UNKNOWN"
@@ -66,6 +67,12 @@ STYLE_SINGLE = "single"
 STYLE_SPLIT = "split"
 OUTPUT_STYLES = (STYLE_PER_OBJECT, STYLE_SINGLE, STYLE_SPLIT)
 DEFAULT_OUTPUT_STYLE = STYLE_PER_OBJECT
+
+# How many objects one IEnumWbemClassObject::Next round trip asks for.
+ENV_BATCH_SIZE = "WMIC_IMPACKET_BATCH_SIZE"
+DEFAULT_BATCH_SIZE = 100
+MAX_BATCH_SIZE = 10000
+WBEM_INFINITE = 0xFFFFFFFF
 
 # ---------------------------------------------------------------------------
 # CIM types ([MS-WMIO] 2.2.78 CimType).  Impacket reports a property's type as the
@@ -239,6 +246,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-classes",
         action="store_true",
         help="same as --output-style split",
+    )
+    ours.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="objects fetched per network round trip, 1-%d (default: $%s or %d)"
+        % (MAX_BATCH_SIZE, ENV_BATCH_SIZE, DEFAULT_BATCH_SIZE),
     )
 
     dbg = p.add_argument_group("debugging")
@@ -433,6 +448,15 @@ def parse_args(argv: List[str]) -> types.SimpleNamespace:
     if timeout < 0:
         parser.error("timeout must be >= 0")
     opts.timeout = timeout
+
+    batch = ns.batch_size if ns.batch_size is not None else _env_default(ENV_BATCH_SIZE, DEFAULT_BATCH_SIZE)
+    try:
+        batch = int(batch)
+    except (TypeError, ValueError):
+        parser.error("invalid batch size %r" % (batch,))
+    if not 1 <= batch <= MAX_BATCH_SIZE:
+        parser.error("batch size must be between 1 and %d" % MAX_BATCH_SIZE)
+    opts.batch_size = batch
     return opts
 
 
@@ -642,6 +666,81 @@ def _is_s_false(exc: BaseException) -> bool:
     return "S_FALSE" in str(exc)
 
 
+class BatchDecodeError(Exception):
+    """The reply that ended the enumeration could not be decoded, so the objects
+    it carried are unknown.  Raised instead of silently returning fewer rows:
+    Observium's winservices module deletes services that vanish from a result."""
+
+
+def _final_batch(exc: BaseException, enum, services, imp) -> Optional[List[Any]]:
+    """Objects carried by the reply that ended the enumeration.
+
+    When fewer objects than requested are left, the server answers
+    IEnumWbemClassObject::Next with WBEM_S_FALSE *and* those objects.  Impacket
+    raises that status as an exception but keeps the decoded reply as the
+    exception's packet; this rebuilds the objects from it exactly as
+    IEnumWbemClassObject.Next() does for a WBEM_S_NO_ERROR reply.
+
+    Returns None when the exception carries no decoded reply.
+    """
+    getter = getattr(exc, "get_packet", None)
+    packet = getter() if callable(getter) else getattr(exc, "packet", None)
+    if packet is None:
+        return None
+    items = list(packet["apObjects"])
+    returned = packet["puReturned"]
+    if returned != len(items):
+        raise BatchDecodeError("final reply says %r object(s) but carries %d" % (returned, len(items)))
+    return [
+        imp.wmi.IWbemClassObject(
+            imp.INTERFACE(
+                enum.get_cinstance(),
+                b"".join(item["abData"]),
+                enum.get_ipidRemUnknown(),
+                oxid=enum.get_oxid(),
+                target=enum.get_target(),
+            ),
+            services,
+        )
+        for item in items
+    ]
+
+
+def iter_objects(enum, services, imp, batch_size: int):
+    """Yield every object of a semi-synchronous enumeration, ``batch_size`` per
+    round trip.  ``batch_size=1`` is the classic one-object-per-call loop."""
+    calls = 0
+    total = 0
+    started = time.monotonic()
+    while True:
+        calls += 1
+        t0 = time.monotonic()
+        try:
+            objects = enum.Next(WBEM_INFINITE, batch_size)
+        except Exception as exc:
+            if not _is_s_false(exc):
+                raise
+            final = _final_batch(exc, enum, services, imp)
+            if final is None:
+                if batch_size > 1:
+                    raise BatchDecodeError(
+                        "the last batch of results could not be decoded (%s); retry with --batch-size 1" % exc
+                    )
+                final = []  # with one object per call, WBEM_S_FALSE carries nothing
+            total += len(final)
+            log.debug("Next(%d) #%d: WBEM_S_FALSE with %d object(s) in %.3f s", batch_size, calls, len(final), time.monotonic() - t0)
+            for obj in final:
+                yield obj
+            break
+        log.debug("Next(%d) #%d: %d object(s) in %.3f s", batch_size, calls, len(objects), time.monotonic() - t0)
+        if not objects:
+            break
+        total += len(objects)
+        for obj in objects:
+            yield obj
+    log.debug("%d object(s) in %d round trip(s), %.3f s", total, calls, time.monotonic() - started)
+
+
 # ---------------------------------------------------------------------------
 # Watchdog
 # ---------------------------------------------------------------------------
@@ -691,13 +790,14 @@ class Watchdog:
 # ---------------------------------------------------------------------------
 def load_impacket() -> types.SimpleNamespace:
     """Import just the Impacket pieces we need (startup time matters on slow boxes)."""
-    from impacket.dcerpc.v5.dcomrt import DCOMConnection
+    from impacket.dcerpc.v5.dcomrt import DCOMConnection, INTERFACE
     from impacket.dcerpc.v5.dcom import wmi
     from impacket.dcerpc.v5.dtypes import NULL
     from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, RPC_C_AUTHN_LEVEL_PKT_PRIVACY
 
     return types.SimpleNamespace(
         DCOMConnection=DCOMConnection,
+        INTERFACE=INTERFACE,
         wmi=wmi,
         NULL=NULL,
         RPC_C_AUTHN_LEVEL_PKT_INTEGRITY=RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
@@ -784,18 +884,9 @@ def run_query(opts: types.SimpleNamespace, out, impacket: Optional[types.SimpleN
         try:
             log.debug("ExecQuery: %s", opts.query)
             enum = services.ExecQuery(opts.query)
-            while True:
-                try:
-                    objects = enum.Next(0xFFFFFFFF, 1)
-                except Exception as exc:
-                    if _is_s_false(exc):
-                        break
-                    raise
-                if not objects:
-                    break
-                for obj in objects:
-                    for line in formatter.feed(obj.getClassName(), obj.getProperties()):
-                        out.write(line + "\n")
+            for obj in iter_objects(enum, services, imp, getattr(opts, "batch_size", DEFAULT_BATCH_SIZE)):
+                for line in formatter.feed(obj.getClassName(), obj.getProperties()):
+                    out.write(line + "\n")
         except WatchdogTimeout:
             raise
         except Exception as exc:

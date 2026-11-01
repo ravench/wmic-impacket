@@ -133,9 +133,10 @@ Add `-d1` to see Impacket's debug output on stderr.
 
 The polled account needs: membership in *Distributed COM Users* and *Performance
 Monitor Users*, *Enable Account* + *Remote Enable* on the WMI namespace, the
-*Windows Management Instrumentation (WMI)* firewall rule group, and, for
-`Win32_Service` (Observium's service list), remote list access to the Service
-Control Manager, which Windows grants only to administrators by default. The script
+*Windows Management Instrumentation (WMI)* firewall rule group, and — for the
+service list (`Win32_Service`, Observium's winservices module) — remote access
+to the Service Control Manager and read access on the individual services, both
+of which Windows limits to administrators by default. The script
 [`windows/Grant-WmiAccess.ps1`](windows/Grant-WmiAccess.ps1) does all of that
 idempotently; run it in an elevated **Windows PowerShell 5.1** on the target:
 
@@ -144,12 +145,23 @@ New-LocalUser -Name wmi -Password (Read-Host -AsSecureString) -PasswordNeverExpi
 powershell.exe -ExecutionPolicy Bypass -File .\Grant-WmiAccess.ps1 -User wmi -RemoteAddress 192.0.2.5
 ```
 
-`-Namespace` defaults to `root\cimv2`; `-RemoteAddress` scopes the inbound firewall
-rules to your monitoring host (omit it to leave the scope untouched, `Any` to reset).
-The Service Control Manager step adds `(A;;CCLCRPRC;;;<user SID>)` (connect,
-enumerate, query lock status, read control) and prints the previous descriptor
-for `sc.exe sdset scmanager "<old SDDL>"`; `-SkipServiceManager` leaves it alone.
-`-WhatIf` shows what would change.
+- `-Namespace` defaults to `root\cimv2`.
+- `-RemoteAddress` scopes the inbound firewall rules to your monitoring host
+  (omit it to leave the scope untouched, `Any` to reset).
+- The Service Control Manager step adds `(A;;CCLCRPRC;;;<SID>)` (connect,
+  enumerate, query lock status, read control) and prints the previous descriptor
+  for `sc.exe sdset scmanager "<old SDDL>"`; `-SkipServiceManager` leaves it alone.
+- The per-service step grants read access (`CCLCSWLORC`: query config + status,
+  enumerate dependents, interrogate, read control) on **every** local service by
+  default, because Observium polls them all unless `$config['wmi']['service_permit']`
+  restricts the list. Each changed service's old SDDL is saved to a `...-restore-services-*.cmd`
+  script. Scope it with `-Services MSSQL*,W3SVC,Spooler`, or skip it with `-SkipServices`.
+- `-WhatIf` shows what would change without changing anything.
+
+The per-service grants are what make *all* services visible: the Service Control
+Manager grant only lets the account enumerate the list, while each service's own
+security descriptor still decides whether it can be read, and non-admins cannot
+read some by default (so they silently drop out of `Win32_Service`).
 
 ## Options
 
@@ -168,6 +180,7 @@ Positional: `//HOST` (also `HOST`, `//ncacn_ip_tcp:HOST[sign]`, `//[IPv6]`) and 
 | `-V, --version` | `Version 4.0.0tp4-SVN-build-UNKNOWN (wmic-impacket X, impacket Y)` |
 | `--auth-level {integrity,privacy}` | RPC authentication level for activation and WMI calls; default `privacy`, or `$WMIC_IMPACKET_AUTH_LEVEL` |
 | `--timeout SECONDS` | hard limit for the whole run (SIGALRM watchdog); default 30, or `$WMIC_IMPACKET_TIMEOUT`; `0` disables |
+| `--batch-size N` | objects fetched per network round trip, 1–10000; default 100, or `$WMIC_IMPACKET_BATCH_SIZE`. Larger is faster for big result sets (services); `1` is the slowest but most compatible |
 | `--output-style {per-object,single,split}` | how rows are grouped into `CLASS:`/header blocks, see [Output compatibility](#output-compatibility); default `per-object`, or `$WMIC_IMPACKET_OUTPUT_STYLE` |
 | `--split-classes` | same as `--output-style split` |
 | `--option=name=value`, `-O`, `-s`, `-l`, `-R`, `-m`, `-n`, `-S`, `-k`, `--realm`, `-i`, `-P`, `--simple-bind-dn`, ... | Samba popt options, accepted and ignored |
@@ -230,6 +243,8 @@ style, so it does not tell them apart.
 | `Login to remote object.` + `WBEM_E_INVALID_NAMESPACE` | `--namespace` typo. |
 | `ERROR: Retrieve result data.` + `WBEM_E_INVALID_CLASS` / `WBEM_E_INVALID_QUERY` | Class does not exist on that host / WQL syntax error. |
 | `ERROR: Retrieve result data.` + `WBEM_E_ACCESS_DENIED`, only for `Win32_Service` | Non-admin user without remote access to the Service Control Manager. Run `Grant-WmiAccess.ps1` (step 4) on the target. |
+| `Win32_Service` returns far fewer services than an admin sees | Those services' own security descriptors deny the account. Run `Grant-WmiAccess.ps1` (step 5, default grants all) on the target. |
+| The service query is slow (tens of seconds) and risks the `--timeout` | Raise `--batch-size` (default 100); each round trip is one network latency, and hundreds of services at batch 1 is hundreds of round trips. |
 | `Login to remote object.` + `NT_STATUS_IO_TIMEOUT` after `--timeout` seconds | Packets are dropped, usually by the Windows firewall (WMI rule group disabled, or the network is in the *Public* profile). A rejected connection gives `NT_STATUS_CONNECTION_REFUSED` instead. |
 | `Login to remote object.` + `NT_STATUS_BAD_NETWORK_NAME`, stderr says `empty host name in '//'` | The caller passed `//` with no host name after it. |
 | Observium's device WMI page says "The wmic binary (or script) was not found at the configured path", although the path is right | Observium prints that for *any* failure of its `wmi_cmd()`, including an empty WMI username (wmic is then never run). With *Override WMI Config* ticked, fill in at least the username (a blank hostname falls back to the device hostname); otherwise untick it and set `$config['wmi']['user']` / `['pass']` / `['domain']` globally. |
@@ -241,10 +256,12 @@ is byte-for-byte what `wmiexec.py`/`wmiquery.py` send, so EDR or IDS products ma
 flag the monitoring host. Whitelist it.
 
 Each call starts a Python interpreter, imports Impacket and performs a full DCOM
-handshake (portmapper, activation, NTLM, namespace login, enumeration, one round
-trip per returned instance). That is a few hundred milliseconds of overhead on a
-desktop and noticeably more on a small low-power box; the old
-static binary was faster. Keep `--timeout` comfortably above your slowest query.
+handshake (portmapper, activation, NTLM, namespace login, enumeration). That is a
+few hundred milliseconds of overhead on a desktop and noticeably more on a small
+low-power box; the old static binary was faster. Results are fetched
+`--batch-size` objects per round trip (default 100), so a large result set such
+as the service list costs a handful of round trips rather than one per row. Keep
+`--timeout` comfortably above your slowest query.
 
 ## Development
 

@@ -45,13 +45,17 @@ OBSERVIUM_CMD = (
 class FakeSessionError(Exception):
     """Looks like impacket's DCERPCSessionError / DCERPCException."""
 
-    def __init__(self, error_code, text=None):
+    def __init__(self, error_code, text=None, packet=None):
         Exception.__init__(self)
         self.error_code = error_code
         self._text = text
+        self.packet = packet
 
     def get_error_code(self):
         return self.error_code
+
+    def get_packet(self):
+        return self.packet
 
     def __str__(self):
         if self._text:
@@ -85,26 +89,116 @@ class FakeObj:
         return self._props
 
 
+class _FakeObjRegistry:
+    """Round-trips a FakeObj through the real tool's byte path: the tool joins
+    ``item['abData']`` into raw bytes and rebuilds the object with
+    imp.INTERFACE / imp.wmi.IWbemClassObject, so the fakes hand it a token it can
+    hand back."""
+
+    _store = {}  # type: dict
+    _n = 0
+
+    @classmethod
+    def encode(cls, obj):
+        cls._n += 1
+        token = b"FAKEOBJ:%d;" % cls._n
+        cls._store[token] = obj
+        return token
+
+    @classmethod
+    def decode(cls, raw):
+        return cls._store[raw]
+
+
+class FakePacket:
+    """Stands in for a decoded IEnumWbemClassObject_NextResponse carried by the
+    WBEM_S_FALSE exception: holds the objects of the final short batch, encoded
+    the way a real NextResponse carries them (apObjects[i]['abData'] = bytes)."""
+
+    def __init__(self, objects, returned=None):
+        self._data = {
+            "apObjects": [{"abData": [_FakeObjRegistry.encode(o)]} for o in objects],
+            "puReturned": len(objects) if returned is None else returned,
+        }
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+
+class FakeINTERFACE:
+    """Stand-in for dcomrt.INTERFACE: keeps the raw object bytes the tool joins."""
+
+    def __init__(self, cinstance, raw, ipid, oxid=None, target=None):
+        self.raw = raw
+
+
+class FakeWbemClassObject:
+    """Stand-in for wmi.IWbemClassObject: returns the FakeObj the token maps to."""
+
+    def __new__(cls, interface, services=None):
+        return _FakeObjRegistry.decode(interface.raw)
+
+
+# Two real-world server behaviours for ending an enumeration; the tool must
+# cope with both:
+#   "short": the reply that returns the final, short batch also carries
+#            WBEM_S_FALSE, so Impacket raises and the objects live only in the
+#            exception's packet (the case --batch-size exercises).
+#   "empty": available objects come back as WBEM_S_NO_ERROR; a final empty reply
+#            carries WBEM_S_FALSE (the classic one-object-per-call loop).
+S_FALSE_SHORT = "short"
+S_FALSE_EMPTY = "empty"
+
+
 class FakeEnum:
-    def __init__(self, objects, fail_after=None, sleep=0, noisy=False):
+    """Models a semi-synchronous IEnumWbemClassObject: Next(timeout, count)
+    returns up to ``count`` objects per call."""
+
+    def __init__(self, objects, fail_after=None, sleep=0, noisy=False, s_false=S_FALSE_SHORT, no_packet=False):
         self._objects = list(objects)
         self._fail_after = fail_after
         self._sleep = sleep
         self._noisy = noisy
+        self._s_false = s_false
+        self._no_packet = no_packet  # simulate a reply Impacket could not decode
         self.calls = 0
+        self.max_count = 0
         self.released = False
+
+    def get_cinstance(self):
+        return self
+
+    def get_ipidRemUnknown(self):
+        return None
+
+    def get_oxid(self):
+        return None
+
+    def get_target(self):
+        return "192.0.2.10"
 
     def Next(self, timeout, count):
         self.calls += 1
+        self.max_count = max(self.max_count, count)
         if self._sleep:
             time.sleep(self._sleep)
         if self._noisy:
             print("stray print from inside impacket")
         if self._fail_after is not None and self.calls > self._fail_after:
             raise FakeSessionError(0x80041010, "WMI Session Error: code: 0x80041010 - WBEM_E_INVALID_CLASS")
-        if not self._objects:
-            raise FakeSessionError(1)
-        return [self._objects.pop(0)]
+        batch = self._objects[:count]
+        del self._objects[:count]
+        packet = None if self._no_packet else FakePacket(batch)
+        if self._s_false == S_FALSE_SHORT:
+            # A reply carries WBEM_S_FALSE as soon as it returns fewer than asked.
+            if len(batch) < count:
+                raise FakeSessionError(1, packet=packet)
+            return batch
+        # S_FALSE_EMPTY: full replies are WBEM_S_NO_ERROR, then one trailing reply
+        # carries WBEM_S_FALSE with an empty but decodable NextResponse.
+        if batch:
+            return batch
+        raise FakeSessionError(1, packet=(None if self._no_packet else FakePacket([])))
 
     def RemRelease(self):
         self.released = True
@@ -142,6 +236,8 @@ class FakeServices:
             fail_after=0 if self._fab.fail_at == "next" else self._fab.fail_after,
             sleep=self._fab.sleep,
             noisy=self._fab.noisy,
+            s_false=self._fab.s_false,
+            no_packet=self._fab.no_packet,
         )
         return self.enum
 
@@ -197,12 +293,14 @@ class FakeDCOM:
 class Fabric:
     """Builds a fake impacket namespace and records what happened."""
 
-    def __init__(self, objects=(), fail_at=None, fail_after=None, sleep=0, noisy=False):
+    def __init__(self, objects=(), fail_at=None, fail_after=None, sleep=0, noisy=False, s_false=S_FALSE_SHORT, no_packet=False):
         self.objects = list(objects)
         self.fail_at = fail_at
         self.fail_after = fail_after
         self.sleep = sleep
         self.noisy = noisy
+        self.s_false = s_false
+        self.no_packet = no_packet
         self.dcom = None
         self.login = None
         self.services = None
@@ -214,10 +312,12 @@ class Fabric:
 
         self.impacket = types.SimpleNamespace(
             DCOMConnection=DCOM,
+            INTERFACE=FakeINTERFACE,
             wmi=types.SimpleNamespace(
                 CLSID_WbemLevel1Login="CLSID",
                 IID_IWbemLevel1Login="IID",
                 IWbemLevel1Login=FakeLogin,
+                IWbemClassObject=FakeWbemClassObject,
                 DCERPCSessionError=FakeSessionError,
             ),
             NULL=None,
@@ -300,7 +400,7 @@ class TestNamespace(unittest.TestCase):
 
 class TestArgs(unittest.TestCase):
     def setUp(self):
-        self._env = {k: os.environ.pop(k, None) for k in (w.ENV_AUTH_LEVEL, w.ENV_TIMEOUT, w.ENV_OUTPUT_STYLE)}
+        self._env = {k: os.environ.pop(k, None) for k in (w.ENV_AUTH_LEVEL, w.ENV_TIMEOUT, w.ENV_OUTPUT_STYLE, w.ENV_BATCH_SIZE)}
 
     def tearDown(self):
         for k, v in self._env.items():
@@ -425,6 +525,20 @@ class TestArgs(unittest.TestCase):
             w.parse_args(["//h", "q"])
         with self.assertRaises(w.UsageError):
             w.parse_args(["--output-style", "bogus", "//h", "q"])
+
+    def test_batch_size(self):
+        self.assertEqual(w.parse_args(["//h", "q"]).batch_size, w.DEFAULT_BATCH_SIZE)
+        self.assertEqual(w.parse_args(["--batch-size", "1", "//h", "q"]).batch_size, 1)
+        self.assertEqual(w.parse_args(["--batch-size", "500", "//h", "q"]).batch_size, 500)
+        os.environ[w.ENV_BATCH_SIZE] = "250"
+        self.assertEqual(w.parse_args(["//h", "q"]).batch_size, 250)
+        self.assertEqual(w.parse_args(["--batch-size", "1", "//h", "q"]).batch_size, 1)
+        for bad in ("0", "-5", str(w.MAX_BATCH_SIZE + 1), "x"):
+            with self.assertRaises(w.UsageError, msg=bad):
+                w.parse_args(["--batch-size", bad, "//h", "q"])
+        os.environ[w.ENV_BATCH_SIZE] = "nonsense"
+        with self.assertRaises(w.UsageError):
+            w.parse_args(["//h", "q"])
 
     def test_version_and_split(self):
         self.assertTrue(w.parse_args(["-V"]).version)
@@ -630,6 +744,49 @@ class TestRun(unittest.TestCase):
         self.assertEqual(blocks("--output-style split", SERVICES), 1)
         self.assertEqual(blocks("--split-classes", MIXED), 3)
 
+    def test_batching_returns_every_row(self):
+        # Every batch size, and both server end-of-enumeration behaviours, must
+        # yield all 250 rows exactly once and in order (Observium's winservices
+        # module deletes any service missing from the result).
+        objs = [FakeObj("Win32_Service", [("Name", S("Svc%03d" % i)), ("State", S("Running"))]) for i in range(250)]
+        expected = ["Svc%03d##Running" % i for i in range(250)]
+        for s_false in (S_FALSE_SHORT, S_FALSE_EMPTY):
+            for bs in ("1", "7", "100", "250", "1000"):
+                fab = Fabric(objects=list(objs), s_false=s_false)
+                code, out, err = run_fake(
+                    "--output-style single --delimiter=## --batch-size %s -U u%%p //h 'select * from Win32_Service'" % bs,
+                    fab,
+                )
+                self.assertEqual(code, 0, err)
+                data = [ln for ln in out.splitlines() if ln.startswith("Svc")]
+                self.assertEqual(data, expected, "bs=%s s_false=%s" % (bs, s_false))
+                self.assertEqual(fab.services.enum.max_count, int(bs))  # asked for the configured size
+
+    def test_batching_round_trip_count(self):
+        objs = [FakeObj("Win32_Service", [("Name", S("S%d" % i))]) for i in range(10)]
+        fab = Fabric(objects=list(objs), s_false=S_FALSE_SHORT)
+        run_fake("--batch-size 4 -U u%p //h 'select * from Win32_Service'", fab)
+        # 10 objects, 4 per round trip: [4][4][2←S_FALSE] = 3 calls
+        self.assertEqual(fab.services.enum.calls, 3)
+
+    def test_empty_result_with_batching(self):
+        for s_false in (S_FALSE_SHORT, S_FALSE_EMPTY):
+            code, out, err = run_fake("--batch-size 100 -U u%p //h 'select * from x'", Fabric(objects=[], s_false=s_false))
+            self.assertEqual((code, out, err), (0, "", ""), s_false)
+
+    def test_undecodable_final_batch_fails_rather_than_dropping_rows(self):
+        # S_FALSE whose reply Impacket could not decode: with a batch size > 1 we
+        # cannot know how many objects it carried, so fail loudly.
+        fab = Fabric(objects=list(SERVICES), s_false=S_FALSE_SHORT, no_packet=True)
+        code, out, err = run_fake("--batch-size 100 -U u%p //h 'select * from Win32_Service'", fab)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "[wmic-impacket] ERROR: Retrieve result data.\n")
+        self.assertIn("batch-size 1", err)
+        # batch size 1 can never lose rows this way, so it degrades gracefully
+        fab1 = Fabric(objects=list(SERVICES), s_false=S_FALSE_SHORT, no_packet=True)
+        code, out, err = run_fake("--batch-size 1 -U u%p //h 'select * from Win32_Service'", fab1)
+        self.assertEqual(code, 0, err)
+
     def assert_login_error(self, fab, ntstatus, detail_fragment):
         code, out, err = run_fake("-U wmi%pw -W WORKGROUP //192.0.2.10 'select * from Win32_BIOS'", fab)
         self.assertEqual(code, 1)
@@ -676,8 +833,9 @@ class TestRun(unittest.TestCase):
         self.assertTrue(fab.dcom.disconnected)
 
     def test_error_on_next_after_some_rows_still_flags_error(self):
+        # One object per round trip: first Next succeeds, second raises mid-stream.
         fab = Fabric(objects=list(SERVICES), fail_after=1)
-        code, out, err = run_fake("-U u%p //h 'select * from Win32_Service'", fab)
+        code, out, err = run_fake("--batch-size 1 -U u%p //h 'select * from Win32_Service'", fab)
         self.assertEqual(code, 1)
         self.assertTrue(out.startswith("CLASS: Win32_Service\n"))
         self.assertTrue(out.endswith("[wmic-impacket] ERROR: Retrieve result data.\n"))
@@ -853,6 +1011,78 @@ class TestRealImpacketDecoding(unittest.TestCase):
 
         self.assertTrue(w._is_s_false(wmi.DCERPCSessionError(error_code=1)))
         self.assertFalse(w._is_s_false(wmi.DCERPCSessionError(error_code=0x80041010)))
+
+    def _objref_bytes(self):
+        from impacket.dcerpc.v5.dcom import wmi
+        from impacket.dcerpc.v5 import dcomrt
+
+        objref = dcomrt.OBJREF_CUSTOM()
+        objref["iid"] = wmi.IID_IWbemClassObject
+        objref["clsid"] = b"\x00" * 16
+        objref["cbExtension"] = 0
+        objref["ObjectReferenceSize"] = len(SAMPLE_INSTANCE)
+        objref["pObjectData"] = SAMPLE_INSTANCE
+        return objref.getData()
+
+    def test_final_batch_rebuilds_objects_from_exception_packet(self):
+        """The novel part of batching: when the enumeration ends with WBEM_S_FALSE
+        carrying objects, recover them from the exception's packet and decode them
+        with real Impacket, exactly as IEnumWbemClassObject.Next() decodes a
+        normal reply."""
+        from impacket.dcerpc.v5.dcom import wmi
+        from impacket.dcerpc.v5 import dcomrt
+
+        raw = self._objref_bytes()
+        # 'abData' as the NDR layer yields it to IEnumWbemClassObject.Next():
+        # an iterable of single bytes that b''.join() concatenates back to 'raw'.
+        ab = [raw[i:i + 1] for i in range(len(raw))]
+
+        class Packet:
+            def __init__(self, items, returned):
+                self._d = {"apObjects": items, "puReturned": returned}
+
+            def __getitem__(self, key):
+                return self._d[key]
+
+        exc = wmi.DCERPCSessionError(error_code=1)
+        exc.packet = Packet([{"abData": ab}, {"abData": ab}], 2)
+
+        class StubEnum:
+            def get_cinstance(self):
+                return dcomrt.CLASS_INSTANCE(None, None)
+
+            def get_ipidRemUnknown(self):
+                return None
+
+            def get_oxid(self):
+                return None
+
+            def get_target(self):
+                return "192.0.2.10"
+
+        imp = w.load_impacket()
+        objs = w._final_batch(exc, StubEnum(), None, imp)
+        self.assertEqual(len(objs), 2)
+        for obj in objs:
+            self.assertEqual(obj.getClassName(), "MyClass")
+            self.assertEqual(list(obj.getProperties()), ["Id", "Data1", "Data2", "Array"])
+
+    def test_final_batch_count_mismatch_raises(self):
+        from impacket.dcerpc.v5.dcom import wmi
+
+        class Packet:
+            def __getitem__(self, key):
+                return {"apObjects": [{"abData": [b"x"]}], "puReturned": 5}[key]
+
+        exc = wmi.DCERPCSessionError(error_code=1)
+        exc.packet = Packet()
+        with self.assertRaises(w.BatchDecodeError):
+            w._final_batch(exc, None, None, w.load_impacket())
+
+    def test_final_batch_without_packet_returns_none(self):
+        from impacket.dcerpc.v5.dcom import wmi
+
+        self.assertIsNone(w._final_batch(wmi.DCERPCSessionError(error_code=1), None, None, w.load_impacket()))
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,17 @@
          Win32_Service queries fail with WBEM_E_ACCESS_DENIED for non-admins.
          The previous descriptor is printed so it can be restored with
          sc.exe sdset scmanager "<old SDDL>".  Skip with -SkipServiceManager.
+      5. Grants the user read access (query config + status, enumerate
+         dependents, interrogate, read control) on individual services, so they
+         appear in Win32_Service.  The SCM grant in step 4 lets the account
+         *enumerate* services, but each service's own security descriptor still
+         decides whether the account may read it, and non-admins cannot read
+         some by default -- those are silently missing from the result.  By
+         default every local service is granted (Observium polls them all unless
+         $config['wmi']['service_permit'] restricts the list); pass -Services to
+         limit the set, or -SkipServices to skip this entirely.  Every changed
+         service's previous SDDL is written to a restore script so the change
+         can be undone.
 
     Requires Windows PowerShell 5.1 (the WMI cmdlets and the [wmiclass] accelerator
     are not available in PowerShell 7).
@@ -43,10 +54,23 @@
 .PARAMETER SkipServiceManager
     Do not touch the Service Control Manager's security descriptor (step 4).
 
+.PARAMETER Services
+    Names of the services to grant read access on (step 5).  Accepts service
+    names (not display names) and wildcards, e.g. -Services MSSQL*,W3SVC.
+    Default: every local service.
+
+.PARAMETER SkipServices
+    Do not touch individual service security descriptors (step 5).
+
+.PARAMETER RestoreScript
+    Where to write the sc.exe commands that undo the step 5 changes.
+    Default: a timestamped file under the current directory.
+
 .EXAMPLE
     PS> .\Grant-WmiAccess.ps1
     PS> .\Grant-WmiAccess.ps1 -User wmi -RemoteAddress 192.0.2.5
-    PS> .\Grant-WmiAccess.ps1 -Namespace 'root\cimv2' -WhatIf
+    PS> .\Grant-WmiAccess.ps1 -Services MSSQL*,W3SVC,Spooler
+    PS> .\Grant-WmiAccess.ps1 -SkipServices -Namespace 'root\cimv2' -WhatIf
 
 .NOTES
     Part of wmic-impacket (https://github.com/ravench/wmic-impacket), MIT licence.
@@ -64,7 +88,13 @@ param(
 
     [string[]]$RemoteAddress,
 
-    [switch]$SkipServiceManager
+    [switch]$SkipServiceManager,
+
+    [string[]]$Services,
+
+    [switch]$SkipServices,
+
+    [string]$RestoreScript
 )
 
 Set-StrictMode -Version 2.0
@@ -247,6 +277,64 @@ if (-not $SkipServiceManager) {
             $sdset = @(& sc.exe sdset scmanager $newSddl)
             if ($LASTEXITCODE -ne 0) { throw "sc.exe sdset scmanager failed: $($sdset -join ' ')" }
             Write-Host "[+] Granted $($localUser.Name) remote service list access (Service Control Manager)"
+        }
+    }
+}
+
+# --- 5. individual services -------------------------------------------------
+# WMI enumerates services through the SCM (step 4) but then reads each one;
+# a service whose own SD denies the account is left out of Win32_Service.
+# Grant read: SERVICE_QUERY_CONFIG (CC), SERVICE_QUERY_STATUS (LC),
+# SERVICE_ENUMERATE_DEPENDENTS (SW), SERVICE_INTERROGATE (LO), READ_CONTROL (RC).
+if (-not $SkipServices) {
+    $svcAceMask = 'CCLCSWLORC'
+    $svcAce     = "(A;;$svcAceMask;;;$sid)"
+
+    if ($Services) {
+        $targets = @(Get-Service -Name $Services -ErrorAction SilentlyContinue)
+    } else {
+        $targets = @(Get-Service)
+    }
+    if ($targets.Count -eq 0) {
+        Write-Warning "No matching services found; step 5 skipped."
+    } else {
+        if (-not $RestoreScript) {
+            $RestoreScript = Join-Path (Get-Location) ("Grant-WmiAccess-restore-services-{0:yyyyMMdd-HHmmss}.cmd" -f (Get-Date))
+        }
+        $restoreLines = @('@echo off', 'rem Restores service security descriptors changed by Grant-WmiAccess.ps1')
+        $granted = 0; $already = 0; $failed = 0
+        foreach ($svc in $targets) {
+            $name = $svc.Name
+            try {
+                $out = & sc.exe sdshow "$name" 2>&1
+                if ($LASTEXITCODE -ne 0) { throw ($out -join ' ') }
+                $cur = (($out | Where-Object { $_ -match '\S' }) -join '').Trim()
+                if ($cur -notmatch '^(O:[^:]+)?(G:[^:]+)?D:') {
+                    throw "unexpected SDDL: $cur"
+                }
+                if ($cur -match [regex]::Escape(";$sid)")) {
+                    $already++
+                    continue
+                }
+                $saclAt = $cur.IndexOf('S:')
+                if ($saclAt -ge 0) { $new = $cur.Insert($saclAt, $svcAce) } else { $new = $cur + $svcAce }
+                if ($PSCmdlet.ShouldProcess($name, "Add $svcAce")) {
+                    $restoreLines += "sc.exe sdset `"$name`" `"$cur`""
+                    $res = & sc.exe sdset "$name" "$new" 2>&1
+                    if ($LASTEXITCODE -ne 0) { throw ($res -join ' ') }
+                    $granted++
+                }
+            } catch {
+                $failed++
+                Write-Warning "Service '$name': $($_.Exception.Message)"
+            }
+        }
+        if ($granted -gt 0 -and -not $WhatIfPreference) {
+            Set-Content -Path $RestoreScript -Value $restoreLines -Encoding ASCII
+            Write-Host "[+] Granted read access on $granted service(s); $already already had it, $failed failed"
+            Write-Host "[i] To undo the service changes, run: $RestoreScript"
+        } else {
+            Write-Host "[=] Services: $already already granted, $granted to change, $failed failed"
         }
     }
 }
