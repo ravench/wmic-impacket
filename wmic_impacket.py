@@ -8,7 +8,11 @@ activation requests with System event 10036.  This tool reproduces wmic's comman
 line and output format on top of Impacket, which can run the whole DCOM/WMI
 conversation at RPC_C_AUTHN_LEVEL_PKT_INTEGRITY or PKT_PRIVACY.
 
-The output format is what Observium's ``wmi_parse()`` expects:
+The output format is what Observium's ``wmi_parse()`` expects.  By default every
+object gets its own block, which is what current Observium releases (and the
+Impacket-based ``scripts/wmic`` they bundle) expect; ``--output-style single``
+prints one block for the whole result, for Observium releases whose parser was
+written for the original wmic:
 
     CLASS: <class name>
     <prop>|<prop>|...
@@ -35,7 +39,7 @@ import types
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 # The version string the original binary reports; some tooling greps for it.
 SAMBA_WMIC_VERSION = "4.0.0tp4-SVN-build-UNKNOWN"
@@ -54,6 +58,14 @@ AUTH_LEVELS = ("integrity", "privacy")
 
 ENV_AUTH_LEVEL = "WMIC_IMPACKET_AUTH_LEVEL"
 ENV_TIMEOUT = "WMIC_IMPACKET_TIMEOUT"
+ENV_OUTPUT_STYLE = "WMIC_IMPACKET_OUTPUT_STYLE"
+
+# How result rows are grouped into CLASS:/header blocks (see OutputFormatter).
+STYLE_PER_OBJECT = "per-object"
+STYLE_SINGLE = "single"
+STYLE_SPLIT = "split"
+OUTPUT_STYLES = (STYLE_PER_OBJECT, STYLE_SINGLE, STYLE_SPLIT)
+DEFAULT_OUTPUT_STYLE = STYLE_PER_OBJECT
 
 # ---------------------------------------------------------------------------
 # CIM types ([MS-WMIO] 2.2.78 CimType).  Impacket reports a property's type as the
@@ -154,11 +166,11 @@ class UsageError(Exception):
 
 
 class EmptyHostError(UsageError):
-    """``//`` with nothing after it.  Observium sends exactly that when "Override WMI
-    config" is ticked on a device but the WMI hostname field is blank.  run() reports
-    it as ``Login to remote object.`` (what the original wmic says when it cannot
-    reach a host), because Observium shows a misleading "wmic binary not found"
-    message for any ERROR text it does not know."""
+    """``//`` with nothing after it, e.g. from a caller that builds ``//$hostname``
+    with an empty variable.  run() reports it as ``Login to remote object.`` (what
+    the original wmic says when it cannot reach a host) instead of a free-form
+    ``ERROR:`` text, because callers like Observium only recognise wmic's own
+    messages."""
 
 
 class _Parser(argparse.ArgumentParser):
@@ -213,9 +225,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="hard limit for the whole run, 0 disables (default: $%s or %d)" % (ENV_TIMEOUT, DEFAULT_TIMEOUT),
     )
     ours.add_argument(
+        "--output-style",
+        choices=OUTPUT_STYLES,
+        default=None,
+        help=(
+            "per-object: CLASS/header before every row (current Observium); "
+            "single: one block for all rows (older Observium); "
+            "split: new block when the class changes (original wmic). "
+            "Default: $%s or %s" % (ENV_OUTPUT_STYLE, DEFAULT_OUTPUT_STYLE)
+        ),
+    )
+    ours.add_argument(
         "--split-classes",
         action="store_true",
-        help="start a new CLASS/header block whenever the class changes, like the original wmic",
+        help="same as --output-style split",
     )
 
     dbg = p.add_argument_group("debugging")
@@ -331,7 +354,7 @@ def parse_args(argv: List[str]) -> types.SimpleNamespace:
 
     Raises UsageError for bad input.  Returns an object with attributes:
     host, query, user, password, domain, namespace (Impacket form), delimiter,
-    debuglevel, auth_level, timeout, split_classes, version.
+    debuglevel, auth_level, timeout, output_style, split_classes, version.
     """
     parser = build_parser()
     ns = parser.parse_intermixed_args(argv)
@@ -341,8 +364,18 @@ def parse_args(argv: List[str]) -> types.SimpleNamespace:
     opts.debuglevel = ns.debuglevel or 0
     opts.delimiter = ns.delimiter
     opts.namespace = normalize_namespace(ns.namespace)
-    opts.split_classes = ns.split_classes
     opts.ignored_options = list(ns.option or [])
+
+    if ns.output_style:
+        style = ns.output_style
+    elif ns.split_classes:
+        style = STYLE_SPLIT
+    else:
+        style = str(_env_default(ENV_OUTPUT_STYLE, DEFAULT_OUTPUT_STYLE)).lower()
+    if style not in OUTPUT_STYLES:
+        parser.error("invalid output style %r (use %s)" % (style, ", ".join(OUTPUT_STYLES)))
+    opts.output_style = style
+    opts.split_classes = style == STYLE_SPLIT
 
     if ns.version:
         return opts
@@ -352,8 +385,7 @@ def parse_args(argv: List[str]) -> types.SimpleNamespace:
     opts.host = parse_host(ns.host)
     if not opts.host:
         raise EmptyHostError(
-            "empty host name in %r (in Observium: 'Override WMI config' is enabled "
-            "but the WMI hostname is blank)" % ns.host
+            "empty host name in %r (the caller passed no host after //)" % ns.host
         )
     opts.query = ns.query
 
@@ -471,18 +503,35 @@ def _is_system_property(name: str) -> bool:
 class OutputFormatter:
     """Turns WMI objects into wmic-style text blocks.
 
-    Default mode: one ``CLASS:`` line and one header for the whole result set,
-    taken from the first object; later objects are printed in that column order
-    (missing properties become ``(null)``, extra ones are dropped).  This keeps
-    Observium's ``wmi_parse()`` happy when a query returns subclass instances.
+    ``per-object`` (default): every object gets its own ``CLASS:`` line and header
+    with its own properties.  Current Observium releases reset their parser after
+    each row (they were written for the Impacket-based ``scripts/wmic`` they ship,
+    which prints this layout), so with any other layout they keep only the first
+    row.
 
-    ``split_classes=True`` reproduces the original behaviour: a new ``CLASS:`` and
-    header block whenever the class name changes.
+    ``single``: one ``CLASS:`` line and one header for the whole result set, taken
+    from the first object; later objects are printed in that column order
+    (missing properties become ``(null)``, extra ones are dropped).  For older
+    Observium releases, whose parser treats every line after the header as a data
+    row and dies on a second ``CLASS:`` line (OBS-4409).
+
+    ``split``: the original wmic behaviour, a new ``CLASS:`` and header block
+    whenever the class name changes.
     """
 
-    def __init__(self, delimiter: str = DEFAULT_DELIMITER, split_classes: bool = False, fallback_class: str = ""):
+    def __init__(
+        self,
+        delimiter: str = DEFAULT_DELIMITER,
+        style: str = DEFAULT_OUTPUT_STYLE,
+        fallback_class: str = "",
+        split_classes: bool = False,
+    ):
+        if split_classes:  # backwards-compatible keyword
+            style = STYLE_SPLIT
+        if style not in OUTPUT_STYLES:
+            raise ValueError("unknown output style %r" % (style,))
         self.delimiter = delimiter
-        self.split_classes = split_classes
+        self.style = style
         self.fallback_class = fallback_class
         self.columns = None  # type: Optional[List[str]]
         self.current_class = None  # type: Optional[str]
@@ -495,7 +544,11 @@ class OutputFormatter:
         class_name = (class_name or "").strip() or self.fallback_class or "None"
         lines = []  # type: List[str]
 
-        new_block = self.columns is None or (self.split_classes and class_name != self.current_class)
+        new_block = (
+            self.columns is None
+            or self.style == STYLE_PER_OBJECT
+            or (self.style == STYLE_SPLIT and class_name != self.current_class)
+        )
         if new_block:
             self.columns = names
             self.current_class = class_name
@@ -682,7 +735,7 @@ def run_query(opts: types.SimpleNamespace, out, impacket: Optional[types.SimpleN
     else:
         level = imp.RPC_C_AUTHN_LEVEL_PKT_PRIVACY
 
-    formatter = OutputFormatter(opts.delimiter, opts.split_classes, class_from_query(opts.query))
+    formatter = OutputFormatter(opts.delimiter, opts.output_style, class_from_query(opts.query))
     dcom = None
     try:
         # --- "Login to remote object." phase -------------------------------

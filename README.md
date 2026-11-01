@@ -90,6 +90,28 @@ ln -s /opt/wmic-impacket/bin/wmic /usr/bin/wmic
 Device-side settings (WMI hostname like `ncacn_ip_tcp:host.domain.local[sign]`,
 user, password, domain) need no change; those spellings are understood.
 
+Observium releases whose `wmi_parse()` was written for the original wmic need
+`--output-style single` appended to `$config['wmic']`; see
+[Output style](#output-style).
+
+### Observium's bundled `scripts/wmic`
+
+Recent Observium releases ship their own Impacket-based client,
+`scripts/wmic` (a copy of py-wmi-client). Observium switches to it
+automatically only when `$config['wmic']` is left at its default `/bin/wmic` and
+that file does not exist; it then needs Impacket importable by the system
+`python3` to actually work. If that works for you, you may not need this
+project. Differences, as of the copy reviewed:
+
+| | bundled `scripts/wmic` | wmic-impacket |
+| --- | --- | --- |
+| Install | Impacket for the system `python3` (on Debian 12+ pip refuses system-wide installs, PEP 668) | own venv |
+| NULL values | printed as `None` (or `0` for uint32/uint64) | `(null)`, which Observium turns into an empty string |
+| Errors | Python traceback on stderr, nothing on stdout | wmic-style `ERROR:` line on stdout, NTSTATUS and cause on stderr |
+| Hung host | no time limit | `--timeout`, default 30 s |
+| Command line | `-U`, `-A`, `--delimiter`, `--namespace` only | full Samba wmic option set |
+| Older Observium parsers | per-object layout only | `--output-style single` |
+
 ## Quick manual test
 
 ```sh
@@ -141,7 +163,8 @@ Positional: `//HOST` (also `HOST`, `//ncacn_ip_tcp:HOST[sign]`, `//[IPv6]`) and 
 | `-V, --version` | `Version 4.0.0tp4-SVN-build-UNKNOWN (wmic-impacket X, impacket Y)` |
 | `--auth-level {integrity,privacy}` | RPC authentication level for activation and WMI calls; default `privacy`, or `$WMIC_IMPACKET_AUTH_LEVEL` |
 | `--timeout SECONDS` | hard limit for the whole run (SIGALRM watchdog); default 30, or `$WMIC_IMPACKET_TIMEOUT`; `0` disables |
-| `--split-classes` | original behaviour: new `CLASS:`/header block whenever the class changes |
+| `--output-style {per-object,single,split}` | how rows are grouped into `CLASS:`/header blocks, see [Output compatibility](#output-compatibility); default `per-object`, or `$WMIC_IMPACKET_OUTPUT_STYLE` |
+| `--split-classes` | same as `--output-style split` |
 | `--option=name=value`, `-O`, `-s`, `-l`, `-R`, `-m`, `-n`, `-S`, `-k`, `--realm`, `-i`, `-P`, `--simple-bind-dn`, ... | Samba popt options, accepted and ignored |
 
 Kerberos, pass-the-hash and `ncacn_np` transports are not implemented; NTLM over
@@ -167,20 +190,29 @@ Spooler|Running|True
   `wmi_parse()` looks for `ERROR:` there), an `NTSTATUS: NT_STATUS_... - text`
   line plus the Impacket exception on stderr, exit code 1.
 
-Deliberate deviations:
+### Output style
 
-1. **One block per query (default).** The original starts a new `CLASS:` line and
-   header whenever the class of a returned instance changes, e.g. a
-   `Win32_TerminalService` row in `SELECT ... FROM Win32_Service`. Observium's older
-   `wmi_parse()` treats that second `CLASS:` line as a data row and dies in
-   `array_combine()` on PHP 8 (OBS-4409). wmic-impacket prints a single `CLASS:`
-   line (class of the first instance, or the `FROM` class) and a single header
-   taken from the first instance; later rows follow that column order, missing
-   properties become `(null)`, extra ones are dropped. `--split-classes` restores
-   the original layout.
-2. **CR/LF inside values become a space.** Some `Description` fields contain line
+Observium's `wmi_parse()` has changed over the years, and the two generations
+need different layouts for multi-row results (CPUs, disks, services, MSSQL
+instances):
+
+| `--output-style` | Layout | Use with |
+| --- | --- | --- |
+| `per-object` (default) | `CLASS:` line and header before **every** row | Current Observium releases. Their parser resets after each row (it was written for the Impacket-based `scripts/wmic` Observium now bundles), so with any other layout only the first row survives. |
+| `single` | one `CLASS:` line and header, then all rows; the header comes from the first row, missing properties become `(null)`, extra ones are dropped | Older Observium releases, whose parser treats every line after the header as a data row and dies in `array_combine()` on PHP 8 when it meets a second `CLASS:` line (OBS-4409). |
+| `split` | a new block whenever the class changes, e.g. a `Win32_TerminalService` row in `SELECT ... FROM Win32_Service` | Exactly what the original Samba `wmic` printed. |
+
+Not sure which one your Observium has? Check `includes/wmi.inc.php`: if
+`wmi_parse()` sets `$wmi_class = NULL` again after storing a row, keep the
+default; otherwise append `--output-style single` to `$config['wmic']`. A
+single-row test such as `SELECT Name FROM Win32_ComputerSystem` works with every
+style, so it does not tell them apart.
+
+### Other deliberate deviations
+
+1. **CR/LF inside values become a space.** Some `Description` fields contain line
    breaks, which break every line-based parser.
-3. A NULL of any scalar type prints as `(null)`, not just NULL strings.
+2. A NULL of any scalar type prints as `(null)`, not just NULL strings.
 
 ## Troubleshooting
 
@@ -192,7 +224,9 @@ Deliberate deviations:
 | `Login to remote object.` + `NT_STATUS_ACCESS_DENIED` with `WBEM_E_ACCESS_DENIED` (`0x80041003`) | DCOM fine, but no *Enable Account* / *Remote Enable* on the namespace. |
 | `Login to remote object.` + `WBEM_E_INVALID_NAMESPACE` | `--namespace` typo. |
 | `ERROR: Retrieve result data.` + `WBEM_E_INVALID_CLASS` / `WBEM_E_INVALID_QUERY` | Class does not exist on that host / WQL syntax error. |
-| `Login to remote object.` + `NT_STATUS_BAD_NETWORK_NAME`, stderr says `empty host name in '//'` | Observium sent no host name: *Override WMI config* is ticked on the device but the WMI hostname is blank. Untick the override (the device hostname and the global `$config['wmi']` credentials are then used) or fill in every field. Older builds of this tool printed `ERROR: empty host name`, which Observium reported as "The wmic binary (or script) was not found". |
+| `Login to remote object.` + `NT_STATUS_BAD_NETWORK_NAME`, stderr says `empty host name in '//'` | The caller passed `//` with no host name after it. |
+| Observium's device WMI page says "The wmic binary (or script) was not found at the configured path", although the path is right | Observium prints that for *any* failure of its `wmi_cmd()`, including an empty WMI username (wmic is then never run). With *Override WMI Config* ticked, fill in at least the username (a blank hostname falls back to the device hostname); otherwise untick it and set `$config['wmi']['user']` / `['pass']` / `['domain']` globally. |
+| Observium only shows the first CPU / disk / service | The output style does not match your Observium's parser. Current releases need the default `per-object`; releases whose `wmi_parse()` does not reset after each row need `--output-style single` (append it to `$config['wmic']`). |
 | Observium shows the device as having no WMI data | Run the exact command from `includes/wmi.inc.php` by hand with `-d1`. |
 
 Impacket is also a well-known penetration-testing toolkit. Its DCOM/WMI traffic
@@ -214,8 +248,17 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
 The tests run offline against fakes of the Impacket objects, decode a genuine
-Impacket-encoded WMI instance, and pipe generated output through Observium's real
-`wmi_parse()` (`tests/observium_wmi_parse.php`; skipped if `php` is not on the PATH).
+Impacket-encoded WMI instance, and pipe generated output through Observium's
+older `wmi_parse()` (`tests/observium_wmi_parse.php`; skipped if `php` is not on
+the PATH).
+
+To check the output against the parser of the Observium you actually run, point
+`OBSERVIUM_DIR` at the install; `tests/observium_current_parse.php` loads its
+`includes/wmi.inc.php` at run time (nothing from it is copied into this repo):
+
+```sh
+OBSERVIUM_DIR=/opt/observium .venv/bin/python -m unittest discover -s tests -v
+```
 
 ## License
 

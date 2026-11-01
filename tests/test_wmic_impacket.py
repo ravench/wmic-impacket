@@ -300,7 +300,7 @@ class TestNamespace(unittest.TestCase):
 
 class TestArgs(unittest.TestCase):
     def setUp(self):
-        self._env = {k: os.environ.pop(k, None) for k in (w.ENV_AUTH_LEVEL, w.ENV_TIMEOUT)}
+        self._env = {k: os.environ.pop(k, None) for k in (w.ENV_AUTH_LEVEL, w.ENV_TIMEOUT, w.ENV_OUTPUT_STYLE)}
 
     def tearDown(self):
         for k, v in self._env.items():
@@ -318,6 +318,7 @@ class TestArgs(unittest.TestCase):
         self.assertEqual(opts.namespace, "//./root/CIMV2")
         self.assertEqual(opts.auth_level, "privacy")
         self.assertEqual(opts.timeout, 30.0)
+        self.assertEqual(opts.output_style, "per-object")
         self.assertFalse(opts.split_classes)
 
     def test_observium_command_line(self):
@@ -409,6 +410,22 @@ class TestArgs(unittest.TestCase):
             with self.assertRaises(w.UsageError, msg=argv):
                 w.parse_args(argv)
 
+    def test_output_style(self):
+        self.assertEqual(w.parse_args(["//h", "q"]).output_style, "per-object")
+        self.assertEqual(w.parse_args(["--output-style", "single", "//h", "q"]).output_style, "single")
+        self.assertEqual(w.parse_args(["--output-style=split", "//h", "q"]).output_style, "split")
+        self.assertEqual(w.parse_args(["--split-classes", "//h", "q"]).output_style, "split")
+        # an explicit --output-style beats --split-classes
+        self.assertEqual(w.parse_args(["--split-classes", "--output-style", "single", "//h", "q"]).output_style, "single")
+        os.environ[w.ENV_OUTPUT_STYLE] = "Single"
+        self.assertEqual(w.parse_args(["//h", "q"]).output_style, "single")
+        self.assertEqual(w.parse_args(["--output-style", "per-object", "//h", "q"]).output_style, "per-object")
+        os.environ[w.ENV_OUTPUT_STYLE] = "bogus"
+        with self.assertRaises(w.UsageError):
+            w.parse_args(["//h", "q"])
+        with self.assertRaises(w.UsageError):
+            w.parse_args(["--output-style", "bogus", "//h", "q"])
+
     def test_version_and_split(self):
         self.assertTrue(w.parse_args(["-V"]).version)
         self.assertTrue(w.parse_args(["--split-classes", "//h", "q"]).split_classes)
@@ -493,8 +510,33 @@ class TestOutputFormatter(unittest.TestCase):
             lines.extend(f.feed(obj.getClassName(), obj.getProperties()))
         return lines
 
-    def test_single_block_default(self):
-        lines = self.render(MIXED)
+    def test_per_object_default(self):
+        lines = self.render(MIXED, delimiter="##")
+        self.assertEqual(
+            lines,
+            [
+                "CLASS: Win32_Service",
+                "Name##State##ProcessId",
+                "Spooler##Running##1234",
+                "CLASS: Win32_TerminalService",
+                "Name##State##ProcessId##TotalSessions",
+                "TermService##Running##0##3",
+                "CLASS: Win32_Service",
+                "Name##State",
+                "Fax##Stopped",
+            ],
+        )
+        # same class twice: still one block per object
+        lines = self.render(SERVICES)
+        self.assertEqual(lines.count("CLASS: Win32_Service"), 2)
+        self.assertEqual(lines.count("Name|State|Started"), 2)
+
+    def test_unknown_style_rejected(self):
+        with self.assertRaises(ValueError):
+            w.OutputFormatter(style="bogus")
+
+    def test_single_block(self):
+        lines = self.render(MIXED, style="single")
         self.assertEqual(
             lines,
             [
@@ -547,6 +589,8 @@ class TestRun(unittest.TestCase):
             "CLASS: Win32_Service\n"
             "Name##State##Started\n"
             "Spooler##Running##True\n"
+            "CLASS: Win32_Service\n"
+            "Name##State##Started\n"
             "Fax##Stopped##False\n",
         )
         self.assertEqual(err, "")
@@ -573,13 +617,18 @@ class TestRun(unittest.TestCase):
         self.assertEqual(fab.dcom.kwargs["authLevel"], 5)
         self.assertEqual(fab.services.dce.auth_level, 5)
 
-    def test_mixed_classes_default_and_split(self):
-        code, out, _ = run_fake("-U u%p //h 'select * from Win32_Service'", Fabric(objects=list(MIXED)))
-        self.assertEqual(code, 0)
-        self.assertEqual(out.count("CLASS:"), 1)
-        code, out, _ = run_fake("--split-classes -U u%p //h 'select * from Win32_Service'", Fabric(objects=list(MIXED)))
-        self.assertEqual(code, 0)
-        self.assertEqual(out.count("CLASS:"), 3)
+    def test_output_styles_end_to_end(self):
+        def blocks(args, objects):
+            code, out, _ = run_fake(args + " -U u%p //h 'select * from Win32_Service'", Fabric(objects=list(objects)))
+            self.assertEqual(code, 0)
+            return out.count("CLASS:")
+
+        self.assertEqual(blocks("", SERVICES), 2)
+        self.assertEqual(blocks("", MIXED), 3)
+        self.assertEqual(blocks("--output-style single", SERVICES), 1)
+        self.assertEqual(blocks("--output-style single", MIXED), 1)
+        self.assertEqual(blocks("--output-style split", SERVICES), 1)
+        self.assertEqual(blocks("--split-classes", MIXED), 3)
 
     def assert_login_error(self, fab, ntstatus, detail_fragment):
         code, out, err = run_fake("-U wmi%pw -W WORKGROUP //192.0.2.10 'select * from Win32_BIOS'", fab)
@@ -643,7 +692,7 @@ class TestRun(unittest.TestCase):
         fab = Fabric(objects=list(SERVICES))
         code, out, err = run_fake("-d2 -U u%p //h 'select * from Win32_Service'", fab)
         self.assertEqual(code, 0)
-        self.assertEqual(out.count("\n"), 4)
+        self.assertEqual(out.count("\n"), 6)  # 2 objects x (CLASS, header, row)
         self.assertNotIn("DEBUG", out)
         self.assertIn("DEBUG wmic_impacket: connecting to h", err)
         # level 0: silent
@@ -673,7 +722,7 @@ class TestRun(unittest.TestCase):
         self.assertIn("usage:", err)
 
     def test_empty_host_is_a_login_error(self):
-        # Observium with "Override WMI config" ticked and every field blank.
+        # A caller that built "//$hostname" from an empty variable.
         fab = Fabric()
         code, out, err = run_fake(
             "--user='' --no-pass --delimiter=## --namespace='root\\CIMV2' // 'SELECT Name FROM Win32_ComputerSystem'",
@@ -682,7 +731,7 @@ class TestRun(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "[wmic-impacket] ERROR: Login to remote object.\n")
         self.assertIn("NTSTATUS: NT_STATUS_BAD_NETWORK_NAME", err)
-        self.assertIn("Override WMI config", err)
+        self.assertIn("empty host name", err)
         self.assertIsNone(fab.dcom, "must not try to connect anywhere")
 
     def test_help(self):
@@ -692,6 +741,7 @@ class TestRun(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("--auth-level", buf.getvalue())
         self.assertIn("--split-classes", buf.getvalue())
+        self.assertIn("--output-style", buf.getvalue())
 
     @unittest.skipUnless(hasattr(w.signal, "SIGALRM"), "SIGALRM not available")
     def test_watchdog_timeout(self):
@@ -809,7 +859,11 @@ class TestRealImpacketDecoding(unittest.TestCase):
 # Observium compatibility: feed our output through the real wmi_parse()
 # ---------------------------------------------------------------------------
 @unittest.skipUnless(PHP, "php not installed")
-class TestObserviumCompatibility(unittest.TestCase):
+class TestObserviumOldParser(unittest.TestCase):
+    """The older wmi_parse() (tests/observium_wmi_parse.php) needs --output-style single."""
+
+    SINGLE = "--output-style single "
+
     def php(self, text, delimiter="##", ret_single=False, ret_val=""):
         proc = subprocess.run(
             [PHP, "-d", "display_errors=stderr", "-d", "error_reporting=E_ALL", PHP_SCRIPT, delimiter, "1" if ret_single else "0", ret_val],
@@ -828,7 +882,7 @@ class TestObserviumCompatibility(unittest.TestCase):
         return json.loads(proc.stdout)
 
     def test_services(self):
-        _, out, _ = run_fake(OBSERVIUM_CMD, Fabric(objects=list(SERVICES)))
+        _, out, _ = run_fake(self.SINGLE + OBSERVIUM_CMD, Fabric(objects=list(SERVICES)))
         self.assertEqual(
             self.parse(out),
             [
@@ -846,7 +900,7 @@ class TestObserviumCompatibility(unittest.TestCase):
         self.assertEqual(self.parse(out, delimiter="|", ret_single=True, ret_val="Caption"), "Microsoft Windows 11 Pro")
 
     def test_mixed_classes_single_block_parses(self):
-        _, out, _ = run_fake("--delimiter=## -U u%p //h 'select * from Win32_Service'", Fabric(objects=list(MIXED)))
+        _, out, _ = run_fake(self.SINGLE + "--delimiter=## -U u%p //h 'select * from Win32_Service'", Fabric(objects=list(MIXED)))
         self.assertEqual(
             self.parse(out),
             [
@@ -879,6 +933,78 @@ class TestObserviumCompatibility(unittest.TestCase):
     def test_empty_result(self):
         _, out, _ = run_fake("-U u%p //h 'select * from x'", Fabric(objects=[]))
         self.assertEqual(self.parse(out), [])
+
+
+OBSERVIUM_DIR = os.environ.get("OBSERVIUM_DIR", "")
+CURRENT_PHP_SCRIPT = os.path.join(HERE, "observium_current_parse.php")
+
+
+@unittest.skipUnless(
+    PHP and OBSERVIUM_DIR and os.path.isfile(os.path.join(OBSERVIUM_DIR, "includes", "wmi.inc.php")),
+    "set OBSERVIUM_DIR to an Observium install (and install php) to test against its own wmi_parse()",
+)
+class TestObserviumInstalledParser(unittest.TestCase):
+    """Runs the wmi_parse() of the Observium install in $OBSERVIUM_DIR, e.g.
+    OBSERVIUM_DIR=/opt/observium python -m unittest discover -s tests"""
+
+    def parse(self, text, ret_single=False):
+        proc = subprocess.run(
+            [PHP, "-d", "display_errors=stderr", "-d", "error_reporting=E_ALL", CURRENT_PHP_SCRIPT, "##", "1" if ret_single else "0"],
+            input=text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=60,
+            env=dict(os.environ, OBSERVIUM_DIR=OBSERVIUM_DIR),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout), proc.stderr
+
+    def test_default_style_keeps_every_row(self):
+        _, out, _ = run_fake(OBSERVIUM_CMD, Fabric(objects=list(SERVICES)))
+        rows, err = self.parse(out)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            rows,
+            [
+                {"Name": "Spooler", "State": "Running", "Started": "True"},
+                {"Name": "Fax", "State": "Stopped", "Started": "False"},
+            ],
+        )
+
+    def test_default_style_mixed_classes(self):
+        _, out, _ = run_fake("--delimiter=## -U u%p //h 'select * from Win32_Service'", Fabric(objects=list(MIXED)))
+        rows, err = self.parse(out)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            rows,
+            [
+                {"Name": "Spooler", "State": "Running", "ProcessId": "1234"},
+                {"Name": "TermService", "State": "Running", "ProcessId": "0", "TotalSessions": "3"},
+                {"Name": "Fax", "State": "Stopped"},
+            ],
+        )
+
+    def test_single_row_ret_single(self):
+        objs = [FakeObj("Win32_ComputerSystem", [("Name", S("WINHOST"))])]
+        _, out, _ = run_fake(OBSERVIUM_CMD, Fabric(objects=objs))
+        rows, _ = self.parse(out, ret_single=True)
+        self.assertEqual(rows, {"Name": "WINHOST"})
+
+    def test_errors_give_null(self):
+        for fail_at in ("login", "query"):
+            _, out, _ = run_fake(OBSERVIUM_CMD, Fabric(fail_at=fail_at))
+            rows, _ = self.parse(out)
+            self.assertIsNone(rows, fail_at)
+
+    def test_single_style_loses_rows_on_current_parser(self):
+        """Documents why per-object is the default: a parser that resets after
+        each row keeps only the first row of a single-block result."""
+        _, out, _ = run_fake("--output-style single " + OBSERVIUM_CMD, Fabric(objects=list(SERVICES)))
+        rows, _ = self.parse(out)
+        if len(rows) == 2:
+            self.skipTest("this Observium's wmi_parse() handles single blocks; --output-style single is fine here")
+        self.assertEqual(rows, [{"Name": "Spooler", "State": "Running", "Started": "True"}])
 
 
 if __name__ == "__main__":
