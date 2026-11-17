@@ -233,7 +233,7 @@ if ($existing) {
             $existing.AccessMask = $newMask
             $existing.AceFlags   = $newFlags
             $changed = $true
-            Write-Host "[+] Updated existing ACE for $sid on $Namespace"
+            Write-Host "[+] Updating existing ACE for $sid on $Namespace"
         }
     }
 } else {
@@ -247,15 +247,22 @@ if ($existing) {
         $ace.Trustee    = $trustee
         $dacl += $ace.PSObject.ImmediateBaseObject
         $changed = $true
-        Write-Host "[+] Added ACE for $sid on $Namespace"
+        Write-Host "[+] Adding ACE for $sid on $Namespace"
     }
 }
 
 if ($changed) {
-    # Re-assign the whole DACL (unwrapped objects), then write it back.
-    $descriptor.DACL = @($dacl | ForEach-Object {
-        if ($_ -is [System.Management.ManagementBaseObject]) { $_ } else { $_.PSObject.ImmediateBaseObject }
-    })
+    # Re-assign the whole DACL, then write it back.  The property only accepts a
+    # ManagementBaseObject[]; an Object[] of PSObject-wrapped entries (which is
+    # what a pipeline produces) fails with "PSObject cannot be converted to
+    # ManagementBaseObject", so build the typed array element by element.
+    $typedDacl = New-Object 'System.Management.ManagementBaseObject[]' $dacl.Count
+    for ($i = 0; $i -lt $dacl.Count; $i++) {
+        $entry = $dacl[$i]
+        if ($entry -is [System.Management.Automation.PSObject]) { $entry = $entry.PSObject.BaseObject }
+        $typedDacl[$i] = [System.Management.ManagementBaseObject]$entry
+    }
+    $descriptor.DACL = $typedDacl
     Invoke-WmiSecurityMethod -Ns $Namespace -Method 'SetSecurityDescriptor' -Arguments @($descriptor.PSObject.ImmediateBaseObject) | Out-Null
     Write-Host "[+] Security descriptor of $Namespace written"
 }
