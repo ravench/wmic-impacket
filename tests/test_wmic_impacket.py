@@ -909,7 +909,8 @@ class TestRun(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 3)
         self.assertEqual(code, 1)
-        self.assertEqual(out, "[wmic-impacket] ERROR: Login to remote object.\n")
+        # the fake hangs while fetching results, so this is a result error
+        self.assertEqual(out, "[wmic-impacket] ERROR: Retrieve result data.\n")
         self.assertIn("NTSTATUS: NT_STATUS_IO_TIMEOUT", err)
         self.assertTrue(fab.dcom.disconnected)
         # the alarm must be disarmed again

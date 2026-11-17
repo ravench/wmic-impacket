@@ -40,7 +40,7 @@ import types
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # The version string the original binary reports; some tooling greps for it.
 SAMBA_WMIC_VERSION = "4.0.0tp4-SVN-build-UNKNOWN"
@@ -887,7 +887,10 @@ def run_query(opts: types.SimpleNamespace, out, impacket: Optional[types.SimpleN
             for obj in iter_objects(enum, services, imp, getattr(opts, "batch_size", DEFAULT_BATCH_SIZE)):
                 for line in formatter.feed(obj.getClassName(), obj.getProperties()):
                     out.write(line + "\n")
-        except WatchdogTimeout:
+        except WatchdogTimeout as exc:
+            # Connected fine, but the results did not arrive in time: report it
+            # as a result error, not as a login failure.
+            exc.phase = MSG_RESULT
             raise
         except Exception as exc:
             raise WmicError(MSG_RESULT, exc)
@@ -1004,7 +1007,7 @@ def run(argv: Optional[List[str]] = None, stdout=None, stderr=None, impacket: Op
         report_error(out, err, exc.message, exc.cause, opts.debuglevel)
         code = 1
     except WatchdogTimeout as exc:
-        report_error(out, err, MSG_LOGIN, exc, opts.debuglevel)
+        report_error(out, err, getattr(exc, "phase", MSG_LOGIN), exc, opts.debuglevel)
         code = 1
     except KeyboardInterrupt:
         err.write("%s interrupted\n" % TAG)
