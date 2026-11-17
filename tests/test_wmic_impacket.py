@@ -400,7 +400,7 @@ class TestNamespace(unittest.TestCase):
 
 class TestArgs(unittest.TestCase):
     def setUp(self):
-        self._env = {k: os.environ.pop(k, None) for k in (w.ENV_AUTH_LEVEL, w.ENV_TIMEOUT, w.ENV_OUTPUT_STYLE, w.ENV_BATCH_SIZE)}
+        self._env = {k: os.environ.pop(k, None) for k in (w.ENV_AUTH_LEVEL, w.ENV_TIMEOUT, w.ENV_CONNECT_TIMEOUT, w.ENV_OUTPUT_STYLE, w.ENV_BATCH_SIZE)}
 
     def tearDown(self):
         for k, v in self._env.items():
@@ -417,7 +417,8 @@ class TestArgs(unittest.TestCase):
         self.assertEqual(opts.delimiter, "##")
         self.assertEqual(opts.namespace, "//./root/CIMV2")
         self.assertEqual(opts.auth_level, "privacy")
-        self.assertEqual(opts.timeout, 30.0)
+        self.assertEqual(opts.timeout, 300.0)
+        self.assertEqual(opts.connect_timeout, 30.0)
         self.assertEqual(opts.output_style, "per-object")
         self.assertFalse(opts.split_classes)
 
@@ -440,7 +441,7 @@ class TestArgs(unittest.TestCase):
         self.assertEqual(opts.password, "")
 
     def test_observium_extra_flags_appended_to_binary_path(self):
-        # $config['wmic'] = '/opt/wmic-impacket/bin/wmic --timeout 20 --auth-level integrity';
+        # extra options, e.g. from a wrapper script
         opts = w.parse_args(shlex.split("--timeout 20 --auth-level integrity " + OBSERVIUM_CMD))
         self.assertEqual(opts.timeout, 20.0)
         self.assertEqual(opts.auth_level, "integrity")
@@ -525,6 +526,15 @@ class TestArgs(unittest.TestCase):
             w.parse_args(["//h", "q"])
         with self.assertRaises(w.UsageError):
             w.parse_args(["--output-style", "bogus", "//h", "q"])
+
+    def test_connect_timeout(self):
+        self.assertEqual(w.parse_args(["--connect-timeout", "5", "//h", "q"]).connect_timeout, 5.0)
+        self.assertEqual(w.parse_args(["--connect-timeout", "0", "//h", "q"]).connect_timeout, 0.0)
+        os.environ[w.ENV_CONNECT_TIMEOUT] = "12"
+        self.assertEqual(w.parse_args(["//h", "q"]).connect_timeout, 12.0)
+        for bad in ("-1", "x"):
+            with self.assertRaises(w.UsageError, msg=bad):
+                w.parse_args(["--connect-timeout", bad, "//h", "q"])
 
     def test_batch_size(self):
         self.assertEqual(w.parse_args(["//h", "q"]).batch_size, w.DEFAULT_BATCH_SIZE)
@@ -900,6 +910,36 @@ class TestRun(unittest.TestCase):
         self.assertIn("--auth-level", buf.getvalue())
         self.assertIn("--split-classes", buf.getvalue())
         self.assertIn("--output-style", buf.getvalue())
+
+    @unittest.skipUnless(hasattr(w.signal, "SIGALRM"), "SIGALRM not available")
+    def test_slow_results_outlive_the_connect_timeout(self):
+        # Logging in is instant, fetching takes 1 s: a 0.3 s connect limit must
+        # not cut the result phase short, only --timeout applies there.
+        fab = Fabric(objects=list(SERVICES), sleep=1)
+        code, out, err = run_fake("--connect-timeout 0.3 --timeout 20 -U u%p //h 'select * from Win32_Service'", fab)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count("CLASS: Win32_Service"), 2)
+        self.assertEqual(w.signal.getitimer(w.signal.ITIMER_REAL), (0.0, 0.0))
+
+    @unittest.skipUnless(hasattr(w.signal, "SIGALRM"), "SIGALRM not available")
+    def test_connect_timeout_fails_fast(self):
+        # The host never answers the login: fail after --connect-timeout, long
+        # before --timeout, and say so as a login error.
+        fab = Fabric(objects=list(SERVICES), fail_at=None)
+        original = fab.impacket.DCOMConnection
+
+        def hanging(*args, **kwargs):
+            time.sleep(5)
+            return original(*args, **kwargs)
+
+        fab.impacket.DCOMConnection = hanging
+        started = time.monotonic()
+        code, out, err = run_fake("--connect-timeout 0.4 --timeout 60 -U u%p //h 'select * from Win32_Service'", fab)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "[wmic-impacket] ERROR: Login to remote object.\n")
+        self.assertIn("NT_STATUS_IO_TIMEOUT", err)
+        self.assertIn("no connection after 0.4 seconds", err)
 
     @unittest.skipUnless(hasattr(w.signal, "SIGALRM"), "SIGALRM not available")
     def test_watchdog_timeout(self):

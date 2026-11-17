@@ -40,7 +40,7 @@ import types
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 # The version string the original binary reports; some tooling greps for it.
 SAMBA_WMIC_VERSION = "4.0.0tp4-SVN-build-UNKNOWN"
@@ -53,12 +53,14 @@ MSG_RESULT = "Retrieve result data."
 
 DEFAULT_NAMESPACE = "root\\cimv2"
 DEFAULT_DELIMITER = "|"
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 300          # whole run
+DEFAULT_CONNECT_TIMEOUT = 30   # connect + log in
 DEFAULT_AUTH_LEVEL = "privacy"
 AUTH_LEVELS = ("integrity", "privacy")
 
 ENV_AUTH_LEVEL = "WMIC_IMPACKET_AUTH_LEVEL"
 ENV_TIMEOUT = "WMIC_IMPACKET_TIMEOUT"
+ENV_CONNECT_TIMEOUT = "WMIC_IMPACKET_CONNECT_TIMEOUT"
 ENV_OUTPUT_STYLE = "WMIC_IMPACKET_OUTPUT_STYLE"
 
 # How result rows are grouped into CLASS:/header blocks (see OutputFormatter).
@@ -230,6 +232,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help="hard limit for the whole run, 0 disables (default: $%s or %d)" % (ENV_TIMEOUT, DEFAULT_TIMEOUT),
+    )
+    ours.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="limit for connecting and logging in, so a dead host fails fast; 0 = only --timeout applies "
+        "(default: $%s or %d)" % (ENV_CONNECT_TIMEOUT, DEFAULT_CONNECT_TIMEOUT),
     )
     ours.add_argument(
         "--output-style",
@@ -448,6 +458,17 @@ def parse_args(argv: List[str]) -> types.SimpleNamespace:
     if timeout < 0:
         parser.error("timeout must be >= 0")
     opts.timeout = timeout
+
+    connect_timeout = (
+        ns.connect_timeout if ns.connect_timeout is not None else _env_default(ENV_CONNECT_TIMEOUT, DEFAULT_CONNECT_TIMEOUT)
+    )
+    try:
+        connect_timeout = float(connect_timeout)
+    except (TypeError, ValueError):
+        parser.error("invalid connect timeout %r" % (connect_timeout,))
+    if connect_timeout < 0:
+        parser.error("connect timeout must be >= 0")
+    opts.connect_timeout = connect_timeout
 
     batch = ns.batch_size if ns.batch_size is not None else _env_default(ENV_BATCH_SIZE, DEFAULT_BATCH_SIZE)
     try:
@@ -745,7 +766,14 @@ def iter_objects(enum, services, imp, batch_size: int):
 # Watchdog
 # ---------------------------------------------------------------------------
 class Watchdog:
-    """Hard time limit for the whole run, based on SIGALRM.
+    """Hard time limits, based on SIGALRM.
+
+    Two phases share one timer.  Until ``connected()`` is called the limit is
+    ``connect_seconds`` (connecting and logging in), so an unreachable host fails
+    fast.  After that the timer is re-armed with what is left of ``seconds``, the
+    limit for the whole run, so a slow result set (the service list of a Windows
+    host can take a minute) gets the time it needs.  Either limit can be 0 to
+    switch it off.
 
     The first alarm raises WatchdogTimeout in the main thread, which unwinds
     through Impacket (blocking socket calls are interrupted, PEP 475).  Should
@@ -755,19 +783,50 @@ class Watchdog:
 
     GRACE = 5
 
-    def __init__(self, seconds: float, hard_timeout):
-        self.seconds = seconds
+    def __init__(self, seconds: float, hard_timeout, connect_seconds: float = 0):
+        self.seconds = seconds or 0
+        self.connect_seconds = connect_seconds or 0
         self.hard_timeout = hard_timeout
         self.fired = 0
         self._armed = False
         self._previous = None
+        self._started = None  # type: Optional[float]
+        self._message = ""
+
+    @staticmethod
+    def _supported() -> bool:
+        return hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+
+    def _first_limit(self):
+        """(seconds, message) for the phase before connected()."""
+        total, connect = self.seconds, self.connect_seconds
+        if connect > 0 and (total <= 0 or connect < total):
+            return connect, "no connection after %g seconds" % connect
+        if total > 0:
+            return total, "no result after %g seconds" % total
+        return 0, ""
 
     def __enter__(self):
-        if self.seconds and self.seconds > 0 and hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
+        limit, message = self._first_limit()
+        if (limit > 0 or self.seconds > 0) and self._supported():
+            self._started = time.monotonic()
             self._previous = signal.signal(signal.SIGALRM, self._handle)
-            signal.setitimer(signal.ITIMER_REAL, self.seconds)
             self._armed = True
+            self._message = message
+            if limit > 0:
+                signal.setitimer(signal.ITIMER_REAL, limit)
         return self
+
+    def connected(self):
+        """Connecting and logging in is done: switch to the limit for the whole run."""
+        if not self._armed or self.fired:
+            return
+        if self.seconds > 0:
+            remaining = self.seconds - (time.monotonic() - self._started)
+            self._message = "no result after %g seconds" % self.seconds
+            signal.setitimer(signal.ITIMER_REAL, max(remaining, 0.001))
+        else:
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
     def __exit__(self, exc_type, exc, tb):
         if self._armed:
@@ -781,7 +840,7 @@ class Watchdog:
         self.fired += 1
         if self.fired == 1:
             signal.setitimer(signal.ITIMER_REAL, self.GRACE)
-            raise WatchdogTimeout("no result after %g seconds" % self.seconds)
+            raise WatchdogTimeout(self._message)
         self.hard_timeout()
 
 
@@ -874,6 +933,9 @@ def run_query(opts: types.SimpleNamespace, out, impacket: Optional[types.SimpleN
             except Exception as exc:  # noqa: BLE001
                 log.debug("could not set auth level on class instance: %s", exc)
             _quiet_release(login, "IWbemLevel1Login")
+            on_connected = getattr(opts, "on_connected", None)
+            if on_connected is not None:
+                on_connected()  # watchdog: connect limit -> whole-run limit
         except WatchdogTimeout:
             raise
         except Exception as exc:
@@ -1001,7 +1063,8 @@ def run(argv: Optional[List[str]] = None, stdout=None, stderr=None, impacket: Op
     sys.stdout = err
     code = 1
     try:
-        with Watchdog(opts.timeout, hard_timeout):
+        with Watchdog(opts.timeout, hard_timeout, getattr(opts, "connect_timeout", 0)) as watchdog:
+            opts.on_connected = watchdog.connected
             code = run_query(opts, out, impacket)
     except WmicError as exc:
         report_error(out, err, exc.message, exc.cause, opts.debuglevel)

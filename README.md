@@ -74,10 +74,16 @@ In `config.php`:
 $config['wmic'] = '/opt/wmic-impacket/bin/wmic';
 ```
 
-Extra flags can be appended, Observium concatenates the string into the command:
+No options are needed: the defaults (30 s to connect, 300 s for the whole query)
+fit Observium. If you do need one, note that current Observium releases require
+`$config['wmic']` to be the path of an executable file, so options cannot be
+appended to it (Observium then reports "The wmic binary was not found at the
+configured path"). Set the matching `WMIC_IMPACKET_*` environment variable for
+the poller, or point `$config['wmic']` at a two-line wrapper script:
 
-```php
-$config['wmic'] = '/opt/wmic-impacket/bin/wmic --timeout 20 --auth-level integrity';
+```sh
+#!/bin/sh
+exec /opt/wmic-impacket/bin/wmic --output-style single "$@"
 ```
 
 Alternatively replace the system binary and keep the original around:
@@ -91,7 +97,7 @@ Device-side settings (WMI hostname like `ncacn_ip_tcp:host.domain.local[sign]`,
 user, password, domain) need no change; those spellings are understood.
 
 Observium releases whose `wmi_parse()` was written for the original wmic need
-`--output-style single` appended to `$config['wmic']`; see
+`--output-style single` (see above for how to pass it); see
 [Output style](#output-style).
 
 ### Observium's bundled `scripts/wmic`
@@ -108,7 +114,7 @@ project. Differences, as of the copy reviewed:
 | Install | Impacket for the system `python3` (on Debian 12+ pip refuses system-wide installs, PEP 668) | own venv |
 | NULL values | printed as `None` (or `0` for uint32/uint64) | `(null)`, which Observium turns into an empty string |
 | Errors | Python traceback on stderr, nothing on stdout | wmic-style `ERROR:` line on stdout, NTSTATUS and cause on stderr |
-| Hung host | no time limit | `--timeout`, default 30 s |
+| Hung host | no time limit | fails after `--connect-timeout` (30 s); slow results get `--timeout` (300 s) |
 | Command line | `-U`, `-A`, `--delimiter`, `--namespace` only | full Samba wmic option set |
 | Older Observium parsers | per-object layout only | `--output-style single` |
 
@@ -208,7 +214,8 @@ Positional: `//HOST` (also `HOST`, `//ncacn_ip_tcp:HOST[sign]`, `//[IPv6]`) and 
 | `-d, --debuglevel N` | `-d1`/`-d2`: debug output on **stderr** (Impacket logger at DEBUG) |
 | `-V, --version` | `Version 4.0.0tp4-SVN-build-UNKNOWN (wmic-impacket X, impacket Y)` |
 | `--auth-level {integrity,privacy}` | RPC authentication level for activation and WMI calls; default `privacy`, or `$WMIC_IMPACKET_AUTH_LEVEL` |
-| `--timeout SECONDS` | hard limit for the whole run (SIGALRM watchdog); default 30, or `$WMIC_IMPACKET_TIMEOUT`; `0` disables |
+| `--timeout SECONDS` | hard limit for the whole run (SIGALRM watchdog); default 300, or `$WMIC_IMPACKET_TIMEOUT`; `0` disables |
+| `--connect-timeout SECONDS` | limit for connecting and logging in, so an unreachable host fails fast while a slow result set still gets `--timeout`; default 30, or `$WMIC_IMPACKET_CONNECT_TIMEOUT`; `0` = only `--timeout` applies |
 | `--batch-size N` | objects fetched per network round trip, 1–10000; default 100, or `$WMIC_IMPACKET_BATCH_SIZE`. Larger is faster for big result sets (services); `1` is the slowest but most compatible |
 | `--output-style {per-object,single,split}` | how rows are grouped into `CLASS:`/header blocks, see [Output compatibility](#output-compatibility); default `per-object`, or `$WMIC_IMPACKET_OUTPUT_STYLE` |
 | `--split-classes` | same as `--output-style split` |
@@ -251,7 +258,7 @@ instances):
 
 Not sure which one your Observium has? Check `includes/wmi.inc.php`: if
 `wmi_parse()` sets `$wmi_class = NULL` again after storing a row, keep the
-default; otherwise append `--output-style single` to `$config['wmic']`. A
+default; otherwise pass `--output-style single` through a wrapper script. A
 single-row test such as `SELECT Name FROM Win32_ComputerSystem` works with every
 style, so it does not tell them apart.
 
@@ -273,12 +280,12 @@ style, so it does not tell them apart.
 | `ERROR: Retrieve result data.` + `WBEM_E_INVALID_CLASS` / `WBEM_E_INVALID_QUERY` | Class does not exist on that host / WQL syntax error. |
 | `ERROR: Retrieve result data.` + `WBEM_E_ACCESS_DENIED`, only for `Win32_Service` | Non-admin user without remote access to the Service Control Manager. Run `Grant-WmiAccess.ps1` (step 4) on the target. |
 | `Win32_Service` returns far fewer services than an admin sees | Those services' own security descriptors deny the account. Run `Grant-WmiAccess.ps1` (step 5, default grants all) on the target. |
-| The service query is slow (tens of seconds) and risks the `--timeout` | Raise `--batch-size` (default 100); each round trip is one network latency, and hundreds of services at batch 1 is hundreds of round trips. |
-| `Login to remote object.` + `NT_STATUS_IO_TIMEOUT` after `--timeout` seconds | Packets are dropped, usually by the Windows firewall (WMI rule group disabled, or the network is in the *Public* profile). A rejected connection gives `NT_STATUS_CONNECTION_REFUSED` instead. |
-| `Retrieve result data.` + `NT_STATUS_IO_TIMEOUT`, usually after some rows were already printed | The host answered, but the result did not finish within `--timeout` (default 30 s). Typical for the service list on a slow poller or a busy host. Raise it, e.g. `$config['wmic'] = '/opt/wmic-impacket/bin/wmic --timeout 90';`. |
+| The service query is slow (a minute or more) | Windows produces the service list slowly, roughly 0.2 s per service, so a few hundred services take about a minute; that is within the default `--timeout` of 300 s. To make it faster, have Observium ask for fewer services with `$config['wmi']['service_permit']`. |
+| `Login to remote object.` + `NT_STATUS_IO_TIMEOUT`, stderr says `no connection after 30 seconds` | The host did not answer within `--connect-timeout`: packets are dropped, usually by the Windows firewall (WMI rule group disabled, or the network is in the *Public* profile). A rejected connection gives `NT_STATUS_CONNECTION_REFUSED` instead. |
+| `Retrieve result data.` + `NT_STATUS_IO_TIMEOUT`, usually after some rows were already printed | The host answered, but the result did not finish within `--timeout` (default 300 s). Raise `WMIC_IMPACKET_TIMEOUT`, or reduce the result with `service_permit`. |
 | `Login to remote object.` + `NT_STATUS_BAD_NETWORK_NAME`, stderr says `empty host name in '//'` | The caller passed `//` with no host name after it. |
 | Observium's device WMI page says "The wmic binary (or script) was not found at the configured path", although the path is right | Observium prints that for *any* failure of its `wmi_cmd()`, including an empty WMI username (wmic is then never run). With *Override WMI Config* ticked, fill in at least the username (a blank hostname falls back to the device hostname); otherwise untick it and set `$config['wmi']['user']` / `['pass']` / `['domain']` globally. |
-| Observium only shows the first CPU / disk / service | The output style does not match your Observium's parser. Current releases need the default `per-object`; releases whose `wmi_parse()` does not reset after each row need `--output-style single` (append it to `$config['wmic']`). |
+| Observium only shows the first CPU / disk / service | The output style does not match your Observium's parser. Current releases need the default `per-object`; releases whose `wmi_parse()` does not reset after each row need `--output-style single` (through a wrapper script). |
 | Observium shows the device as having no WMI data | Run the exact command from `includes/wmi.inc.php` by hand with `-d1`. |
 
 Impacket is also a well-known penetration-testing toolkit. Its DCOM/WMI traffic
@@ -291,7 +298,7 @@ few hundred milliseconds of overhead on a desktop and noticeably more on a small
 low-power box; the old static binary was faster. Results are fetched
 `--batch-size` objects per round trip (default 100), so a large result set such
 as the service list costs a handful of round trips rather than one per row. Keep
-`--timeout` comfortably above your slowest query.
+`--timeout` (default 300 s) comfortably above your slowest query.
 
 ## Development
 
